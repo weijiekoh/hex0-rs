@@ -1,0 +1,9 @@
+[package]
+version = "0.1.0"
+name = "hex0-program"
+edition = "2021"
+
+[dependencies]
+alloy-sol-types = { workspace = true }
+sp1-zkvm = "5.0.8"
+hex0-lib = { path = "../lib" }
