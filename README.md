@@ -1,57 +1,35 @@
 # hex0-rs
 
-## Quick start
-
-First, install [SP1](https://docs.succinct.xyz/). This project has been tested with: 
-
-```
-$ cargo +succinct --version
-cargo 1.91.0-nightly (840b83a10 2025-07-30)
-
-$ cargo prove --version
-cargo-prove sp1 (3209d54 2025-08-05T20:15:44.228807077Z)
-```
-
-Next, run:
-
-```bash
-./run.sh
-```
-
-The script will compile the `hex0` source files into the `hex1` directory, and
-generate SP1 proofs that the compilation was done correctly. The proofs will be
-in the `proofs` directory.
-
 ## About
 
 The goal of this repository is to allow anyone to generate a succinct
 cryptographic proof that they have executed the `hex0` program such that it
 correctly compiles the following:
 
-- [`stage0-posix/AMD64/hex1_AMD64.hex0`]() to a `hex1` binary with the SHA256 checksum
+- [`stage0-posix/AMD64/hex1_AMD64.hex0`](https://github.com/oriansj/stage0-posix-amd64/blob/82efa0d6be1c9bb993a7a62af1cccd8d2cda91f6/hex1_AMD64.hex0) to a `hex1` binary with the SHA256 checksum
   `c264a212d2b0e1f1bcf34217ed7876bb9324bd7e29cd902bb1cad4d9f45f1cf8`
 
-- `stage0-posix/riscv64/hex1_riscv64.hex0` to a `hex1` binary with the SHA256 checksum
+- [`stage0-posix/riscv64/hex1_riscv64.hex0`](https://github.com/oriansj/stage0-posix-riscv64/blob/4688bc66bdfd00efd5964350c9d76bdb90a0f72e/hex1_riscv64.hex0) to a `hex1` binary with the SHA256 checksum
   `2c0037d9455f282d5612c1cf280b6a681a33ee1fd633375276e4a816101a3574`
 
-- `stage0-posix/riscv32/hex1_riscv32.hex0` to a `hex1` binary with the SHA256 checksum
+- [`stage0-posix/riscv32/hex1_riscv32.hex0`](https://github.com/oriansj/stage0-posix-riscv32/blob/261c67274cbc396dc211b06c933335c09cc35138/hex1_riscv32.hex0) to a `hex1` binary with the SHA256 checksum
   `35a66d6ca6fedcb8e37d5e521ea22c7eda5cf5962eb1455a9b34b8861797ed89`
 
-- `stage0-posix/AArch64/hex1_AArch64.hex0` to a `hex1` binary with the SHA256 checksum
+- [`stage0-posix/AArch64/hex1_AArch64.hex0`](https://github.com/oriansj/stage0-posix-aarch64/blob/9015b9e048bd969ffc7884399a17952f21d7a039/hex1_AArch64.hex0) to a `hex1` binary with the SHA256 checksum
   `ddcfc3f0c0e40459180e994eaa121e51d79bbdee7fed17b33287fdbf85b1ce76`
 
 Slightly more formally speaking, the relation we prove is that, given the following public inputs:
 
-    - the `.hex0` file as a byte array;
-    - the expected SHA256 checksum of the output `hex1` byte array
+- the `.hex0` file as a byte array;
+- the expected SHA256 checksum of the output `hex1` byte array
 
 and no private inputs, the program:
 
-    - processes the `.hex0` file using the same algorithm that the `hex0`
-      binary uses (that is, to convert hexadecimal digits into bytes, and ignore
-      whitespace and comments);
-    - computes the SHA256 hash of the resulting byte array;
-    - and asserts that the computed SHA256 hash matches the expected SHA256 hash.
+- processes the `.hex0` file using the same algorithm that the `hex0`
+  binary uses (that is, to convert hexadecimal digits into bytes, and ignore
+  whitespace and comments);
+- computes the SHA256 hash of the resulting byte array;
+- and asserts that the computed SHA256 hash matches the expected SHA256 hash.
 
 The `hex0` binary is originally from [Jeremiah Orians's `bootstrap-seeds`
 repository](https://github.com/oriansj/bootstrap-seeds/), but rewritten in
@@ -95,6 +73,31 @@ entire StageX toolchain.
 Prover performance will be a severe bottleneck for this project. To mitigate
 this, proofs are uncompressed at the cost of proof size. Furthermore, the
 author is open to exploring more efficient proof systems as they are developed.
+
+Additionally, the SP1 prover and verifier must be boostrapped so that its
+outputs can be trusted. A long-term goal of this project is to do so.
+
+## Quick start
+
+First, install [SP1](https://docs.succinct.xyz/). This project has been tested with: 
+
+```
+$ cargo +succinct --version
+cargo 1.91.0-nightly (840b83a10 2025-07-30)
+
+$ cargo prove --version
+cargo-prove sp1 (3209d54 2025-08-05T20:15:44.228807077Z)
+```
+
+Next, run:
+
+```bash
+./run.sh
+```
+
+The script will compile the `hex0` source files into the `hex1` directory, and
+generate SP1 proofs that the compilation was done correctly. The proofs will be
+in the `proofs` directory.
 
 <!--
 # SP1 Project Template
