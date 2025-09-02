@@ -5,22 +5,21 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use alloy_sol_types::SolType;
-use hex0_lib::{hex0, PublicValuesStruct};
+use hex0_lib::{hex0, PublicInputs};
+use sha2_v0_10_9::{Digest, Sha256};
 
 pub fn main() {
-    // Read an input to the program.
-    //
-    // Behind the scenes, this compiles down to a custom system call which handles reading inputs
-    // from the prover.
-    let n = sp1_zkvm::io::read::<u32>();
+    // Read the inputs to the program
+    let inputs = sp1_zkvm::io::read::<PublicInputs>();
 
-    let result = hex0(n);
+    // Compile the hex0 source bytes
+    let result = hex0(&inputs.source_bytes);
 
-    // Encode the public values of the program.
-    let bytes = PublicValuesStruct::abi_encode(&PublicValuesStruct { result });
+    // Hash the result
+    let mut hasher = Sha256::new();
+    hasher.update(&result);
+    let hash_array: [u8; 32] = hasher.finalize().into();
 
-    // Commit to the public values of the program. The final proof will have a commitment to all the
-    // bytes that were committed to.
-    sp1_zkvm::io::commit_slice(&bytes);
+    // Assert that the hash of the result matches the expected hash.
+    assert_eq!(hash_array, inputs.expected_hash, "Hash mismatch");
 }

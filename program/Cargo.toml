@@ -7,3 +7,5 @@ edition = "2021"
 alloy-sol-types = { workspace = true }
 sp1-zkvm = "5.0.8"
 hex0-lib = { path = "../lib" }
+sha2-v0-10-9 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-4.0.0" }
+serde = "1.0.219"
