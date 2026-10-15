@@ -1,5 +1,3 @@
-/hex0-seed /x86/hex0_x86.hex0 hex0
-./hex0 /x86/kaem-minimal.hex0 kaem-minimal
 ./hex0 /x86/hex1_x86.hex0 hex1
 ./hex1 /x86/hex2_x86.hex1 hex2-0
 ./hex2-0 /x86/catm_x86.hex2 catm
@@ -61,7 +59,7 @@
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/sha256sum.c -o sha256sum
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/match.c -o match
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/mkdir.c -o mkdir
-./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/untar.c -o untar
+  ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/untar.c -o untar
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/ungz.c -o ungz
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/unbz2.c -o unbz2
 ./M2-Mesoplanet --architecture x86 -f /mescc-tools-extra/unxz.c -o unxz

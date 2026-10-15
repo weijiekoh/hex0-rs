@@ -81,8 +81,9 @@ outputs can be trusted. A long-term goal of this project is to do so.
 
 StageX bootstraps on `linux/386`. Its
 [stage0 package](https://codeberg.org/stagex/stagex/src/branch/main/packages/bootstrap/stage0)
-starts from a 181-byte `hex0-seed` and runs 73 commands, listed verbatim in
-`stagex/steps.txt`:
+starts from a 181-byte `hex0-seed` and runs two commands, then hands over to
+`kaem-minimal`, which runs the 71 commands in `stagex/kaem.x86` (vendored
+verbatim):
 
 ```
 /hex0-seed /x86/hex0_x86.hex0     hex0
@@ -96,23 +97,28 @@ starts from a 181-byte `hex0-seed` and runs 73 commands, listed verbatim in
 ...
 ```
 
-`cargo run --release --bin stagex -- --prove` proves the supported steps,
-currently the first 60, which build everything up to and including
-`M2-Planet`. See [PROGRESS.md](PROGRESS.md) for the status and cycle count of
-each step.
+`cargo run --release --bin stagex -- --prove` proves all 73 steps, through
+`M2-Planet` and the `M2-Mesoplanet` builds of mescc-tools-extra. See
+[PROGRESS.md](PROGRESS.md) for the status and cycle count of each step.
 
 Rather than reimplementing each tool, the guest (`program-x86`) runs the real
 binary in a small i386 Linux emulator (`lib/src/x86.rs`): an ELF loader, an
 [iced-x86](https://crates.io/crates/iced-x86) decoder with an executor for the
-instructions stage0 uses, and the `open`, `close`, `read`, `write`, `lseek`,
-`brk`, `chmod` and `exit` system calls over an in-memory filesystem. Any
-instruction, system call or memory access outside that model panics, so no
-proof can be produced for it, and the tool must exit with status 0.
+instructions stage0 uses, and the system calls it makes (`open`, `close`,
+`read`, `write`, `lseek`, `brk`, `chmod`, `access`, `unlink`, `fork`,
+`execve`, `waitpid` and `exit`) over an in-memory filesystem. A forked child
+runs to completion before its parent continues, which is a valid schedule
+because `M2-Mesoplanet` only waits for its children. Any instruction, system
+call or memory access outside that model panics, so no proof can be produced
+for it, and the tool must exit with status 0.
 
-Each proof commits the SHA256 of the tool binary, the argv, and the SHA256 of
-every file the tool read and wrote. The steps link by hash: each step's tool
-and inputs must be the seed, a pinned source file, or an earlier step's
-output. The only trusted binary is the seed, whose hash is
+Each proof commits the SHA256 of the tool binary, the argv and environment,
+the SHA256 of every file the step read and wrote, and every path it found to
+be a directory or missing. The steps link by hash: each step's tool and
+inputs must be the seed, a pinned source file, or an earlier step's output.
+Missing paths must not exist in StageX's build, which the verifier checks
+against `stagex/sources.manifest`, the list of every path in the pinned
+source tarballs. The only trusted binary is the seed, whose hash is
 `f74dcf9cef2aee9eb7723eca755849d474fccd89662947021d1aa08429d23c13`.
 
 `stagex/sources` vendors the files the steps read from the source tarballs

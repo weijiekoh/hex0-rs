@@ -21,19 +21,31 @@ const EDX: usize = 2;
 const ESP: usize = 4;
 
 const O_WRONLY_CREAT_TRUNC: u32 = 0o1101;
+const O_RDWR_CREAT_EXCL: u32 = 0o302;
+const ENOENT: i32 = 2;
+const EEXIST: i32 = 17;
+
+/// What exists at a path outside the files a program has created.
+pub enum Entry {
+    File(Vec<u8>),
+    Dir,
+    Missing,
+}
 
 /// The result of running a program to completion.
 pub struct Exit {
     /// The exit status, as the parent process would see it.
     pub code: u32,
-    /// Files the program loaded through `lookup`, by canonical path.
-    pub loaded: Vec<String>,
-    /// Files the program created, by canonical path.
+    /// Every path looked up through `lookup` and what was found there, in
+    /// order, by canonical path.
+    pub lookups: Vec<(String, Entry)>,
+    /// Files the programs created and did not delete, by canonical path.
     pub created: BTreeMap<String, Vec<u8>>,
-    /// Number of x86 instructions executed.
+    /// Number of x86 instructions executed, across all processes.
     pub instructions: u64,
 }
 
+#[derive(Clone)]
 struct Region {
     start: u32,
     data: Vec<u8>,
@@ -160,16 +172,38 @@ struct File {
     path: String,
     data: Vec<u8>,
     created: bool,
-    loaded: bool,
+    /// Unlinked files stay readable through open file descriptors.
+    deleted: bool,
 }
 
+#[derive(Clone)]
 struct OpenFile {
     file: usize,
     pos: usize,
+    readable: bool,
     writable: bool,
 }
 
-struct Machine<'a> {
+/// State shared by all processes: the filesystem and exit statuses.
+struct Kernel<'a> {
+    lookup: &'a mut dyn FnMut(&str) -> Entry,
+    lookups: Vec<(String, Entry)>,
+    files: Vec<File>,
+    exited: BTreeMap<u32, u32>,
+    next_pid: u32,
+}
+
+/// What the run loop must do after an instruction.
+enum Step {
+    Next,
+    Exit(u32),
+    Fork,
+    Exec(Box<Machine>),
+}
+
+/// A process.
+#[derive(Clone)]
+struct Machine {
     regions: Vec<Region>,
     /// For each 4 KiB page of the address space, the index of the region
     /// that maps it plus one, or 0.
@@ -179,57 +213,86 @@ struct Machine<'a> {
     /// The program break, which may lie inside the heap's last page.
     brk: u32,
     cwd: String,
-    lookup: &'a mut dyn FnMut(&str) -> Option<Vec<u8>>,
     regs: [u32; 8],
     eip: u32,
     cf: bool,
     zf: bool,
     sf: bool,
     of: bool,
-    files: Vec<File>,
     fds: Vec<Option<OpenFile>>,
 }
 
-/// Runs a static i386 Linux ELF with the given argv in the working directory
-/// `cwd`. When the program opens a file it has not created, `lookup` is called
-/// with its canonical path; opening a file that does not exist panics.
+/// Runs a static i386 Linux ELF with the given argv and environment in the
+/// working directory `cwd`. When a program refers to a path it has not
+/// created, `lookup` is called with the canonical path.
 pub fn run(
     elf: &[u8],
     argv: &[String],
+    env: &[String],
     cwd: &str,
-    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    lookup: &mut dyn FnMut(&str) -> Entry,
 ) -> Exit {
-    let mut m = Machine::load(elf, argv, cwd, lookup);
-    // Decoded instructions live outside the machine so that executing one
-    // borrows it instead of copying it.
-    let mut ops = Vec::new();
-    let mut instructions = 0u64;
-    let code = loop {
-        let index = m.decode(&mut ops);
-        let op = &ops[index];
-        m.eip = op.next_ip;
-        instructions += 1;
-        if let Some(code) = m.execute(op) {
-            break code;
-        }
+    let mut k = Kernel {
+        lookup,
+        lookups: Vec::new(),
+        files: Vec::new(),
+        exited: BTreeMap::new(),
+        next_pid: 2,
     };
-    let loaded = m
-        .files
-        .iter()
-        .filter(|f| f.loaded)
-        .map(|f| f.path.clone())
-        .collect();
-    let created = m
+    let mut instructions = 0u64;
+    let code = run_process(
+        Machine::load(elf, argv, env, cwd),
+        &mut k,
+        &mut instructions,
+    );
+    let created = k
         .files
         .into_iter()
-        .filter(|f| f.created)
+        .filter(|f| f.created && !f.deleted)
         .map(|f| (f.path, f.data))
         .collect();
     Exit {
-        code: code & 0xff,
-        loaded,
+        code,
+        lookups: k.lookups,
         created,
         instructions,
+    }
+}
+
+/// Runs a process until it exits and returns its exit status. A forked
+/// child runs to completion before its parent continues, which is a valid
+/// schedule for parents that only wait for their children.
+fn run_process(mut m: Machine, k: &mut Kernel, instructions: &mut u64) -> u32 {
+    // Decoded instructions live outside the machine so that executing one
+    // borrows it instead of copying it.
+    let mut ops = Vec::new();
+    loop {
+        let index = m.decode(&mut ops);
+        let op = &ops[index];
+        m.eip = op.next_ip;
+        *instructions += 1;
+        match m.execute(op, k) {
+            Step::Next => {}
+            Step::Exit(code) => return code & 0xff,
+            Step::Fork => {
+                let pid = k.next_pid;
+                k.next_pid += 1;
+                let mut child = m.clone();
+                child.regs[EAX] = 0;
+                // The child has its own op arena.
+                for r in &mut child.regions {
+                    r.decoded.fill(0);
+                    r.code = (usize::MAX, 0);
+                }
+                let code = run_process(child, k, instructions);
+                k.exited.insert(pid, code);
+                m.regs[EAX] = pid;
+            }
+            Step::Exec(image) => {
+                m = *image;
+                ops.clear();
+            }
+        }
     }
 }
 
@@ -315,15 +378,10 @@ fn mem_size(ms: MemorySize) -> u32 {
     }
 }
 
-impl<'a> Machine<'a> {
+impl Machine {
     /// Loads the ELF and sets up the initial process state the way Linux does
     /// for a static i386 executable.
-    fn load(
-        elf: &[u8],
-        argv: &[String],
-        cwd: &str,
-        lookup: &'a mut dyn FnMut(&str) -> Option<Vec<u8>>,
-    ) -> Machine<'a> {
+    fn load(elf: &[u8], argv: &[String], env: &[String], cwd: &str) -> Machine {
         assert!(
             elf.len() >= 0x34 && elf[..4] == *b"\x7fELF",
             "not an ELF file"
@@ -408,14 +466,12 @@ impl<'a> Machine<'a> {
             brk: brk_start,
             regions,
             cwd: cwd.to_string(),
-            lookup,
             regs: [0; 8],
             eip: entry,
             cf: false,
             zf: false,
             sf: false,
             of: false,
-            files: Vec::new(),
             fds: Vec::new(),
         };
 
@@ -423,20 +479,23 @@ impl<'a> Machine<'a> {
             m.map_pages(i);
         }
 
-        // Initial stack: argc, argv pointers, NULL, an empty environment and
-        // an auxiliary vector holding only AT_NULL. All registers start at 0.
+        // Initial stack: argc, argv pointers, NULL, environment pointers,
+        // NULL and an auxiliary vector holding only AT_NULL. All registers
+        // start at 0.
         let mut sp = STACK_TOP;
         let mut ptrs = Vec::new();
-        for arg in argv.iter().rev() {
-            sp -= arg.len() as u32 + 1;
-            m.write_bytes(sp, arg.as_bytes());
-            m.write(sp + arg.len() as u32, 1, 0);
+        for s in argv.iter().chain(env).rev() {
+            sp -= s.len() as u32 + 1;
+            m.write_bytes(sp, s.as_bytes());
+            m.write(sp + s.len() as u32, 1, 0);
             ptrs.push(sp);
         }
         ptrs.reverse();
         let mut words = vec![argv.len() as u32];
-        words.extend(ptrs);
-        words.extend([0, 0, 0, 0]);
+        words.extend(&ptrs[..argv.len()]);
+        words.push(0);
+        words.extend(&ptrs[argv.len()..]);
+        words.extend([0, 0, 0]);
         sp = (sp - 4 * words.len() as u32) & !15;
         for (i, w) in words.iter().enumerate() {
             m.write(sp + 4 * i as u32, 4, *w);
@@ -636,7 +695,7 @@ impl<'a> Machine<'a> {
 
     /// Executes one instruction whose eip has already been advanced. Returns
     /// the exit code if the program exited.
-    fn execute(&mut self, ins: &Op) -> Option<u32> {
+    fn execute(&mut self, ins: &Op, k: &mut Kernel) -> Step {
         use Mnemonic::*;
         match ins.mnemonic() {
             Mov => {
@@ -869,12 +928,12 @@ impl<'a> Machine<'a> {
                     matches!(ins.args[0], Arg::Imm(0x80)),
                     "unsupported interrupt"
                 );
-                return self.syscall();
+                return self.syscall(k);
             }
             Nop => {}
             m => panic!("unsupported instruction {m:?} before {:#x}", self.eip),
         }
-        None
+        Step::Next
     }
 
     fn c_string(&self, mut addr: u32) -> String {
@@ -898,94 +957,105 @@ impl<'a> Machine<'a> {
             .unwrap_or_else(|| panic!("unsupported file descriptor {fd}"))
     }
 
-    /// Finds an existing file, loading it through `lookup` if needed.
-    fn find_file(&mut self, path: &str) -> Option<usize> {
-        if let Some(i) = self.files.iter().position(|f| f.path == path) {
-            return Some(i);
+    fn path_arg(&self, addr: u32) -> String {
+        canonical(&self.cwd, &self.c_string(addr))
+    }
+
+    /// Reads a NULL-terminated array of string pointers.
+    fn strings_arg(&self, mut addr: u32) -> Vec<String> {
+        let mut strings = Vec::new();
+        loop {
+            let p = self.read(addr, 4);
+            if p == 0 {
+                return strings;
+            }
+            strings.push(self.c_string(p));
+            addr += 4;
         }
-        let data = (self.lookup)(path)?;
-        self.files.push(File {
-            path: path.to_string(),
-            data,
-            created: false,
-            loaded: true,
-        });
-        Some(self.files.len() - 1)
+    }
+
+    fn new_fd(&mut self, file: OpenFile) -> i32 {
+        let slot = match self.fds.iter().position(|f| f.is_none()) {
+            Some(i) => i,
+            None => {
+                self.fds.push(None);
+                self.fds.len() - 1
+            }
+        };
+        self.fds[slot] = Some(file);
+        slot as i32 + 3
     }
 
     /// Handles `int 0x80` using the Linux i386 system call ABI.
-    fn syscall(&mut self) -> Option<u32> {
+    fn syscall(&mut self, k: &mut Kernel) -> Step {
         let [eax, ecx, edx, ebx, ..] = self.regs;
         let ret: i32 = match eax {
             // exit(code)
-            1 => return Some(ebx),
+            1 => return Step::Exit(ebx),
+            // fork()
+            2 => return Step::Fork,
             // read(fd, buf, count)
             3 => {
                 let f = self.fd(ebx);
-                assert!(!f.writable, "read from write-only file descriptor {ebx}");
+                assert!(f.readable, "read from write-only file descriptor {ebx}");
                 let (file, pos) = (f.file, f.pos);
-                let n = (edx as usize).min(self.files[file].data.len().saturating_sub(pos));
+                let n = (edx as usize).min(k.files[file].data.len().saturating_sub(pos));
                 self.fd(ebx).pos += n;
-                let chunk = std::mem::take(&mut self.files[file].data);
-                self.write_bytes(ecx, &chunk[pos..pos + n]);
-                self.files[file].data = chunk;
+                self.write_bytes(ecx, &k.files[file].data[pos..pos + n]);
                 n as i32
             }
-            // write(fd, buf, count)
+            // write(fd, buf, count): stdout and stderr only go to the log.
+            4 if ebx == 1 || ebx == 2 => {
+                self.read_bytes(ecx, edx);
+                edx as i32
+            }
             4 => {
-                let chunk = self.read_bytes(ecx, edx).to_vec();
                 let f = self.fd(ebx);
                 assert!(f.writable, "write to read-only file descriptor {ebx}");
                 let (file, pos) = (f.file, f.pos);
-                f.pos += chunk.len();
-                let data = &mut self.files[file].data;
+                f.pos += edx as usize;
+                let chunk = self.read_bytes(ecx, edx);
+                let data = &mut k.files[file].data;
                 if data.len() < pos + chunk.len() {
                     data.resize(pos + chunk.len(), 0);
                 }
-                data[pos..pos + chunk.len()].copy_from_slice(&chunk);
+                data[pos..pos + chunk.len()].copy_from_slice(chunk);
                 edx as i32
             }
             // open(path, flags, mode)
             5 => {
-                let path = canonical(&self.cwd, &self.c_string(ebx));
+                let path = self.path_arg(ebx);
                 let file = match ecx {
-                    0 => self
-                        .find_file(&path)
-                        .unwrap_or_else(|| panic!("open of missing file {path}")),
+                    0 => match k.find(&path) {
+                        Some(Found::File(i)) => i,
+                        Some(Found::Dir) => panic!("open of directory {path}"),
+                        None => return self.set_return(-ENOENT),
+                    },
+                    // The result does not depend on whether the file
+                    // existed, so this does not look it up.
                     O_WRONLY_CREAT_TRUNC => {
-                        let i = self
-                            .files
-                            .iter()
-                            .position(|f| f.path == path)
-                            .unwrap_or_else(|| {
-                                self.files.push(File {
-                                    path,
-                                    data: Vec::new(),
-                                    created: true,
-                                    loaded: false,
-                                });
-                                self.files.len() - 1
-                            });
-                        self.files[i].data.clear();
-                        self.files[i].created = true;
-                        i
+                        match k.files.iter().position(|f| f.path == path && !f.deleted) {
+                            Some(i) => {
+                                k.files[i].data.clear();
+                                k.files[i].created = true;
+                                i
+                            }
+                            None => k.create(path),
+                        }
                     }
+                    O_RDWR_CREAT_EXCL => match k.find(&path) {
+                        Some(_) => return self.set_return(-EEXIST),
+                        None => k.create(path),
+                    },
                     _ => panic!("unsupported open flags {ecx:#o}"),
                 };
-                let open = Some(OpenFile {
+                let open = OpenFile {
                     file,
                     pos: 0,
-                    writable: ecx != 0,
-                });
-                let slot = match self.fds.iter().position(|f| f.is_none()) {
-                    Some(i) => i,
-                    None => {
-                        self.fds.push(None);
-                        self.fds.len() - 1
-                    }
+                    readable: ecx & 3 != 1,
+                    writable: ecx & 3 != 0,
                 };
-                self.fds[slot] = open;
-                slot as i32 + 3
+                self.new_fd(open)
             }
             // close(fd)
             6 => {
@@ -993,12 +1063,51 @@ impl<'a> Machine<'a> {
                 self.fds[ebx as usize - 3] = None;
                 0
             }
+            // waitpid(pid, status, 0)
+            7 => {
+                assert_eq!(edx, 0, "unsupported waitpid options {edx}");
+                let code = k
+                    .exited
+                    .remove(&ebx)
+                    .unwrap_or_else(|| panic!("waitpid for unknown child {ebx}"));
+                if ecx != 0 {
+                    self.write(ecx, 4, code << 8);
+                }
+                ebx as i32
+            }
+            // unlink(path): only files the programs created may be deleted.
+            10 => {
+                let path = self.path_arg(ebx);
+                match k.find(&path) {
+                    Some(Found::File(i)) => {
+                        assert!(k.files[i].created, "unlink of input file {path}");
+                        k.files[i].deleted = true;
+                        0
+                    }
+                    Some(Found::Dir) => panic!("unlink of directory {path}"),
+                    None => -ENOENT,
+                }
+            }
+            // execve(path, argv, envp)
+            11 => {
+                let path = self.path_arg(ebx);
+                let (argv, env) = (self.strings_arg(ecx), self.strings_arg(edx));
+                let elf = match k.find(&path) {
+                    Some(Found::File(i)) => k.files[i].data.clone(),
+                    Some(Found::Dir) => panic!("execve of directory {path}"),
+                    None => return self.set_return(-ENOENT),
+                };
+                let mut image = Machine::load(&elf, &argv, &env, &self.cwd);
+                image.fds = std::mem::take(&mut self.fds);
+                return Step::Exec(Box::new(image));
+            }
             // chmod(path, mode): permissions are not modelled.
             15 => {
-                let path = canonical(&self.cwd, &self.c_string(ebx));
-                self.find_file(&path)
-                    .unwrap_or_else(|| panic!("chmod of missing file {path}"));
-                0
+                let path = self.path_arg(ebx);
+                match k.find(&path) {
+                    Some(_) => 0,
+                    None => -ENOENT,
+                }
             }
             // lseek(fd, offset, whence)
             19 => {
@@ -1006,7 +1115,7 @@ impl<'a> Machine<'a> {
                 let base = match edx {
                     0 => 0,
                     1 => self.fd(ebx).pos as i64,
-                    2 => self.files[file].data.len() as i64,
+                    2 => k.files[file].data.len() as i64,
                     _ => panic!("unsupported lseek whence {edx}"),
                 };
                 let pos = base + ecx as i32 as i64;
@@ -1016,6 +1125,14 @@ impl<'a> Machine<'a> {
                 );
                 self.fd(ebx).pos = pos as usize;
                 pos as i32
+            }
+            // access(path, mode): permissions are not modelled.
+            33 => {
+                let path = self.path_arg(ebx);
+                match k.find(&path) {
+                    Some(_) => 0,
+                    None => -ENOENT,
+                }
             }
             // brk(addr): returns the new break, or the old one on failure.
             45 => {
@@ -1041,8 +1158,56 @@ impl<'a> Machine<'a> {
         self.set_return(ret)
     }
 
-    fn set_return(&mut self, ret: i32) -> Option<u32> {
+    fn set_return(&mut self, ret: i32) -> Step {
         self.regs[EAX] = ret as u32;
-        None
+        Step::Next
+    }
+}
+
+enum Found {
+    File(usize),
+    Dir,
+}
+
+impl Kernel<'_> {
+    /// Finds what exists at a canonical path, asking `lookup` about paths
+    /// the programs have not created.
+    fn find(&mut self, path: &str) -> Option<Found> {
+        if let Some(i) = self.files.iter().position(|f| f.path == path && !f.deleted) {
+            return Some(Found::File(i));
+        }
+        if let Some((_, entry)) = self.lookups.iter().find(|(p, _)| p == path) {
+            // A file that was looked up but is not in `files` was deleted.
+            return match entry {
+                Entry::Dir => Some(Found::Dir),
+                _ => None,
+            };
+        }
+        let entry = (self.lookup)(path);
+        let found = match &entry {
+            Entry::File(data) => {
+                self.files.push(File {
+                    path: path.to_string(),
+                    data: data.clone(),
+                    created: false,
+                    deleted: false,
+                });
+                Some(Found::File(self.files.len() - 1))
+            }
+            Entry::Dir => Some(Found::Dir),
+            Entry::Missing => None,
+        };
+        self.lookups.push((path.to_string(), entry));
+        found
+    }
+
+    fn create(&mut self, path: String) -> usize {
+        self.files.push(File {
+            path,
+            data: Vec::new(),
+            created: true,
+            deleted: false,
+        });
+        self.files.len() - 1
     }
 }

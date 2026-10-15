@@ -9,3 +9,7 @@ resolver = "2"
 
 [workspace.dependencies]
 alloy-sol-types = "1.0"
+
+# SP1's SHA-256 precompile, used by the guests through sha2.
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.0.0" }

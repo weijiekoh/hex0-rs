@@ -1782,7 +1782,7 @@ dependencies = [
  "iced-x86",
  "serde",
  "serde_json",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
 ]
 
 [[package]]
@@ -1792,7 +1792,7 @@ dependencies = [
  "alloy-sol-types",
  "hex0-lib",
  "serde",
- "sha2 0.10.9 (git+https://github.com/sp1-patches/RustCrypto-hashes?tag=patch-sha2-0.10.9-sp1-6.0.0)",
+ "sha2",
  "sp1-zkvm",
 ]
 
@@ -1805,7 +1805,7 @@ dependencies = [
  "dotenv",
  "hex",
  "hex0-lib",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "sp1-build",
  "sp1-sdk",
  "tracing",
@@ -2230,7 +2230,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "serdect",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "signature",
 ]
 
@@ -2689,7 +2689,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
 ]
 
 [[package]]
@@ -3955,17 +3955,6 @@ checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 [[package]]
 name = "sha2"
 version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
 source = "git+https://github.com/sp1-patches/RustCrypto-hashes?tag=patch-sha2-0.10.9-sp1-6.0.0#e48b656ebc806117554bb33c2f8687e4637e37ff"
 dependencies = [
  "cfg-if",
@@ -4557,7 +4546,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "libc",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "sp1-core-executor",
  "sp1-core-executor-runner-binary",
  "sp1-jit",
@@ -4749,7 +4738,7 @@ dependencies = [
  "lazy_static",
  "num-bigint 0.4.6",
  "serde",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "slop-algebra",
  "slop-bn254",
  "slop-challenger",
@@ -4786,7 +4775,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "slop-air",
  "slop-algebra",
  "slop-basefold",
@@ -4937,7 +4926,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "serde",
  "serde_json",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "slop-algebra",
  "slop-symmetric",
  "sp1-hypercube",
@@ -5015,7 +5004,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "serde",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "slop-algebra",
  "slop-challenger",
  "slop-primitives",
@@ -5042,7 +5031,7 @@ dependencies = [
  "getrandom 0.3.3",
  "libm",
  "rand 0.8.5",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "sp1-lib",
  "sp1-primitives",
 ]
