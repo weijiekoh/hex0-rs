@@ -28,6 +28,11 @@ struct Args {
     #[arg(long, default_value_t = SUPPORTED_STEPS)]
     steps: usize,
 
+    /// With --execute, the first step to run in the zkVM. Earlier steps run
+    /// natively only, so that ranges of steps can be measured in parallel.
+    #[arg(long, default_value_t = 1)]
+    from: usize,
+
     /// Where to write proofs, with --prove.
     #[arg(long, default_value = "stagex-out")]
     out_dir: String,
@@ -39,6 +44,10 @@ fn main() {
     let args = Args::parse();
     if args.execute == args.prove {
         eprintln!("Error: You must specify either --execute or --prove");
+        std::process::exit(1);
+    }
+    if args.prove && args.from != 1 {
+        eprintln!("Error: --from is only supported with --execute");
         std::process::exit(1);
     }
     std::fs::create_dir_all(&args.out_dir).expect("failed to create output directory");
@@ -64,6 +73,10 @@ fn main() {
         let step = i + 1;
         // Run natively to find the step's inputs and its output files.
         let prepared = chain.prepare(&argv);
+        if step < args.from {
+            chain.accept(&argv, &prepared.claim, prepared.created);
+            continue;
+        }
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&prepared.inputs);
@@ -96,5 +109,7 @@ fn main() {
         let claim: StepClaim = public_values.read();
         chain.accept(&argv, &claim, prepared.created);
     }
-    println!("All steps link from the seed {SEED_SHA256}.");
+    if args.from == 1 {
+        println!("All steps link from the seed {SEED_SHA256}.");
+    }
 }

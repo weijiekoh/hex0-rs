@@ -45,19 +45,15 @@ pub struct Exit {
     pub instructions: u64,
 }
 
-#[derive(Clone)]
-struct Region {
-    start: u32,
-    data: Vec<u8>,
-    writable: bool,
-    /// For segments loaded from the ELF, the decoded instruction at each
-    /// offset, as an index into the op arena plus one, or 0. Writes
-    /// invalidate the entries they may overlap.
-    decoded: Vec<u32>,
-    /// Offsets of the lowest and highest decoded instructions, so that
-    /// writes elsewhere can skip invalidation.
-    code: (usize, usize),
-}
+/// Page table entry flags. An entry is the page's offset in `Machine::mem`
+/// with these flags in its low bits, or 0 if the page is unmapped.
+const MAPPED: u32 = 1;
+const WRITABLE: u32 = 2;
+/// The page holds bytes of cached decoded instructions, so writes to it must
+/// invalidate them.
+const CODE: u32 = 4;
+const FLAGS: u32 = PAGE - 1;
+const PAGES: usize = 1 << 20;
 
 /// An operand with its registers and size already resolved.
 #[derive(Clone, Copy)]
@@ -87,6 +83,83 @@ struct Op {
     count: u8,
     sizes: [u8; 3],
     args: [Arg; 3],
+    fast: Fast,
+}
+
+/// A condition of `jcc` and `setcc`.
+#[derive(Clone, Copy)]
+enum Cond {
+    O,
+    No,
+    B,
+    Ae,
+    E,
+    Ne,
+    Be,
+    A,
+    S,
+    Ns,
+    L,
+    Ge,
+    Le,
+    G,
+}
+
+impl Cond {
+    fn of(m: Mnemonic) -> Option<Cond> {
+        use Mnemonic::*;
+        Some(match m {
+            Jo | Seto => Cond::O,
+            Jno | Setno => Cond::No,
+            Jb | Setb => Cond::B,
+            Jae | Setae => Cond::Ae,
+            Je | Sete => Cond::E,
+            Jne | Setne => Cond::Ne,
+            Jbe | Setbe => Cond::Be,
+            Ja | Seta => Cond::A,
+            Js | Sets => Cond::S,
+            Jns | Setns => Cond::Ns,
+            Jl | Setl => Cond::L,
+            Jge | Setge => Cond::Ge,
+            Jle | Setle => Cond::Le,
+            Jg | Setg => Cond::G,
+            _ => return None,
+        })
+    }
+}
+
+/// Specialized forms of the most frequently executed instructions, with
+/// their 32-bit registers (`r`), byte registers (`index`, `shift`) and
+/// immediates resolved. Memory operands stay in `Op::args`. Every other
+/// instruction is `Generic`.
+#[derive(Clone, Copy)]
+enum Fast {
+    Generic,
+    MovRR(u8, u8),
+    MovRI(u8, u32),
+    MovRM(u8),
+    MovMR(u8),
+    MovB8M(u8, u8),
+    MovMB8(u8, u8),
+    MovzxRB8(u8, u8, u8),
+    MovzxRM8(u8),
+    Lea(u8),
+    PushR(u8),
+    PopR(u8),
+    AddRI(u8, u32),
+    AddRR(u8, u8),
+    SubRI(u8, u32),
+    SubRR(u8, u8),
+    CmpRI(u8, u32),
+    CmpRR(u8, u8),
+    TestRR(u8, u8),
+    CmpB8B8(u8, u8, u8, u8),
+    CmpB8I(u8, u8, u32),
+    Jcc(Cond, u32),
+    Jmp(u32),
+    Call(u32),
+    Ret,
+    Setcc(Cond, u8, u8),
 }
 
 impl Op {
@@ -98,6 +171,73 @@ impl Op {
         self.count as u32
     }
 
+    fn fast_form(&self) -> Fast {
+        use Mnemonic::*;
+        // A full 32-bit register operand.
+        let r = |i: usize| match (self.args[i], self.sizes[i]) {
+            (Arg::Reg { index, shift: 0 }, 4) => Some(index),
+            _ => None,
+        };
+        // A byte register operand.
+        let b = |i: usize| match (self.args[i], self.sizes[i]) {
+            (Arg::Reg { index, shift }, 1) => Some((index, shift)),
+            _ => None,
+        };
+        let m =
+            |i: usize, size: u8| matches!(self.args[i], Arg::Mem { .. }) && self.sizes[i] == size;
+        let imm = |i: usize| match self.args[i] {
+            Arg::Imm(v) => Some(v),
+            _ => None,
+        };
+        let branch = match self.args[0] {
+            Arg::Branch(t) => Some(t),
+            _ => None,
+        };
+        let n = self.count;
+        match self.mnemonic {
+            Mov if n == 2 => match (r(0), r(1), imm(1), b(0), b(1)) {
+                (Some(d), Some(s), ..) => Fast::MovRR(d, s),
+                (Some(d), _, Some(v), ..) => Fast::MovRI(d, v),
+                (Some(d), ..) if m(1, 4) => Fast::MovRM(d),
+                (_, Some(s), ..) if m(0, 4) => Fast::MovMR(s),
+                (_, _, _, Some((i, sh)), _) if m(1, 1) => Fast::MovB8M(i, sh),
+                (_, _, _, _, Some((i, sh))) if m(0, 1) => Fast::MovMB8(i, sh),
+                _ => Fast::Generic,
+            },
+            Movzx => match (r(0), b(1)) {
+                (Some(d), Some((i, sh))) => Fast::MovzxRB8(d, i, sh),
+                (Some(d), _) if m(1, 1) => Fast::MovzxRM8(d),
+                _ => Fast::Generic,
+            },
+            Lea => r(0).map_or(Fast::Generic, Fast::Lea),
+            Push if n == 1 => r(0).map_or(Fast::Generic, Fast::PushR),
+            Pop => r(0).map_or(Fast::Generic, Fast::PopR),
+            Add | Sub | Cmp | Test => match (self.mnemonic, r(0), r(1), imm(1)) {
+                (Add, Some(d), Some(s), _) => Fast::AddRR(d, s),
+                (Add, Some(d), _, Some(v)) => Fast::AddRI(d, v),
+                (Sub, Some(d), Some(s), _) => Fast::SubRR(d, s),
+                (Sub, Some(d), _, Some(v)) => Fast::SubRI(d, v),
+                (Cmp, Some(d), Some(s), _) => Fast::CmpRR(d, s),
+                (Cmp, Some(d), _, Some(v)) => Fast::CmpRI(d, v),
+                (Test, Some(d), Some(s), _) => Fast::TestRR(d, s),
+                (Cmp, None, None, _) => match (b(0), b(1), imm(1)) {
+                    (Some((i, sh)), Some((j, sh2)), _) => Fast::CmpB8B8(i, sh, j, sh2),
+                    (Some((i, sh)), _, Some(v)) => Fast::CmpB8I(i, sh, v),
+                    _ => Fast::Generic,
+                },
+                _ => Fast::Generic,
+            },
+            Jmp => branch.map_or(Fast::Generic, Fast::Jmp),
+            Call => branch.map_or(Fast::Generic, Fast::Call),
+            Ret if n == 0 => Fast::Ret,
+            m => match (Cond::of(m), branch, b(0)) {
+                (Some(c), Some(t), _) => Fast::Jcc(c, t),
+                (Some(c), None, Some((i, sh))) => Fast::Setcc(c, i, sh),
+                _ => Fast::Generic,
+            },
+        }
+    }
+
     fn translate(ins: &Instruction) -> Op {
         let count = ins.op_count().min(3);
         let mut op = Op {
@@ -106,6 +246,7 @@ impl Op {
             count: count as u8,
             sizes: [0; 3],
             args: [Arg::None; 3],
+            fast: Fast::Generic,
         };
         for i in 0..count {
             let (arg, size) = match ins.op_kind(i) {
@@ -164,6 +305,7 @@ impl Op {
             op.args[i as usize] = arg;
             op.sizes[i as usize] = size as u8;
         }
+        op.fast = op.fast_form();
         op
     }
 }
@@ -204,13 +346,19 @@ enum Step {
 /// A process.
 #[derive(Clone)]
 struct Machine {
-    regions: Vec<Region>,
-    /// For each 4 KiB page of the address space, the index of the region
-    /// that maps it plus one, or 0.
-    pages: Vec<u8>,
-    /// Index of the heap region in `regions`; its end is the program break.
-    heap: usize,
-    /// The program break, which may lie inside the heap's last page.
+    /// The bytes of every mapped page, as little-endian words so that
+    /// aligned 32-bit accesses take one load or store.
+    mem: Vec<u32>,
+    /// The page table, with an entry for each 4 KiB page.
+    pages: Box<[u32; PAGES]>,
+    /// Offsets in `mem` of pages unmapped by shrinking the heap.
+    free: Vec<u32>,
+    /// For the ELF image, the decoded instruction at each offset from
+    /// `code_start`, as an index into the op arena plus one, or 0.
+    code_start: u32,
+    decoded: Vec<u32>,
+    /// The program break starts at `brk_start` and may lie inside a page.
+    brk_start: u32,
     brk: u32,
     cwd: String,
     regs: [u32; 8],
@@ -266,24 +414,31 @@ fn run_process(mut m: Machine, k: &mut Kernel, instructions: &mut u64) -> u32 {
     // Decoded instructions live outside the machine so that executing one
     // borrows it instead of copying it.
     let mut ops = Vec::new();
+    // Counted locally, since the count would otherwise be stored on every
+    // instruction.
+    let mut count = 0;
     loop {
         let index = m.decode(&mut ops);
         let op = &ops[index];
         m.eip = op.next_ip;
-        *instructions += 1;
+        count += 1;
+        if m.execute_fast(op) {
+            continue;
+        }
         match m.execute(op, k) {
             Step::Next => {}
-            Step::Exit(code) => return code & 0xff,
+            Step::Exit(code) => {
+                *instructions += count;
+                return code & 0xff;
+            }
             Step::Fork => {
                 let pid = k.next_pid;
                 k.next_pid += 1;
                 let mut child = m.clone();
                 child.regs[EAX] = 0;
                 // The child has its own op arena.
-                for r in &mut child.regions {
-                    r.decoded.fill(0);
-                    r.code = (usize::MAX, 0);
-                }
+                child.decoded.fill(0);
+                *instructions += std::mem::take(&mut count);
                 let code = run_process(child, k, instructions);
                 k.exited.insert(pid, code);
                 m.regs[EAX] = pid;
@@ -395,7 +550,24 @@ impl Machine {
         assert_eq!(u16_at(elf, 0x2a), 32, "unexpected program header size");
         let phnum = u16_at(elf, 0x2c) as usize;
 
-        let mut regions = Vec::new();
+        let mut m = Machine {
+            mem: Vec::with_capacity((STACK_SIZE as usize + elf.len()) / 4 + PAGE as usize),
+            pages: vec![0; PAGES].into_boxed_slice().try_into().unwrap(),
+            free: Vec::new(),
+            code_start: u32::MAX,
+            decoded: Vec::new(),
+            brk_start: 0,
+            brk: 0,
+            cwd: cwd.to_string(),
+            regs: [0; 8],
+            eip: entry,
+            cf: false,
+            zf: false,
+            sf: false,
+            of: false,
+            fds: Vec::new(),
+        };
+        let mut image_end = 0;
         for i in 0..phnum {
             let ph = &elf[phoff + 32 * i..phoff + 32 * (i + 1)];
             let (p_type, offset, vaddr) = (u32_at(ph, 0), u32_at(ph, 4), u32_at(ph, 8));
@@ -417,66 +589,31 @@ impl Machine {
                 .and_then(|e| e.checked_next_multiple_of(PAGE))
                 .filter(|e| *e <= STACK_TOP - STACK_SIZE)
                 .expect("segment outside the user address space");
-            assert!(
-                regions
-                    .iter()
-                    .all(|r: &Region| end <= r.start || start >= r.start + r.data.len() as u32),
-                "overlapping segments"
-            );
-            let mut data = vec![0u8; (end - start) as usize];
+            let writable = if flags & 2 != 0 { WRITABLE } else { 0 };
+            for page in start / PAGE..end / PAGE {
+                m.map(page, writable);
+            }
             let file_off = (offset - offset % PAGE) as usize;
             let n = (file_end - start).min(elf.len().saturating_sub(file_off) as u32) as usize;
-            data[..n].copy_from_slice(&elf[file_off..file_off + n]);
+            let mut data = elf[file_off..file_off + n].to_vec();
             if memsz > filesz {
-                data[(vaddr + filesz - start) as usize..].fill(0);
+                data.truncate((vaddr + filesz - start) as usize);
             }
-            regions.push(Region {
-                start,
-                decoded: vec![0; data.len()],
-                code: (usize::MAX, 0),
-                data,
-                writable: flags & 2 != 0,
-            });
+            for (k, chunk) in data.chunks(PAGE as usize).enumerate() {
+                let o = (m.pages[(start / PAGE) as usize + k] & !FLAGS) as usize;
+                for (i, b) in chunk.iter().enumerate() {
+                    m.set_byte(o + i, *b);
+                }
+            }
+            m.code_start = m.code_start.min(start);
+            image_end = image_end.max(end);
         }
-
-        // The program break starts at the page after the last segment.
-        let brk_start = regions
-            .iter()
-            .map(|r| r.start + r.data.len() as u32)
-            .max()
-            .unwrap();
-        regions.push(Region {
-            start: STACK_TOP - STACK_SIZE,
-            data: vec![0u8; STACK_SIZE as usize],
-            writable: true,
-            decoded: Vec::new(),
-            code: (usize::MAX, 0),
-        });
-        regions.push(Region {
-            start: brk_start,
-            data: Vec::new(),
-            writable: true,
-            decoded: Vec::new(),
-            code: (usize::MAX, 0),
-        });
-
-        let mut m = Machine {
-            pages: vec![0; (1 << 32) / PAGE as usize],
-            heap: regions.len() - 1,
-            brk: brk_start,
-            regions,
-            cwd: cwd.to_string(),
-            regs: [0; 8],
-            eip: entry,
-            cf: false,
-            zf: false,
-            sf: false,
-            of: false,
-            fds: Vec::new(),
-        };
-
-        for i in 0..m.regions.len() {
-            m.map_pages(i);
+        m.decoded = vec![0; (image_end - m.code_start) as usize];
+        // The program break starts at the page after the image.
+        m.brk_start = image_end;
+        m.brk = image_end;
+        for page in (STACK_TOP - STACK_SIZE) / PAGE..STACK_TOP / PAGE {
+            m.map(page, WRITABLE);
         }
 
         // Initial stack: argc, argv pointers, NULL, environment pointers,
@@ -504,54 +641,125 @@ impl Machine {
         m
     }
 
+    /// Maps a zeroed page.
+    fn map(&mut self, page: u32, flags: u32) {
+        assert_eq!(self.pages[page as usize], 0, "overlapping mappings");
+        let off = match self.free.pop() {
+            Some(off) => {
+                self.mem[(off / 4) as usize..((off + PAGE) / 4) as usize].fill(0);
+                off
+            }
+            None => {
+                let off = self.mem.len();
+                self.mem.resize(off + (PAGE / 4) as usize, 0);
+                (off * 4) as u32
+            }
+        };
+        self.pages[page as usize] = off | MAPPED | flags;
+    }
+
+    fn unmap(&mut self, page: u32) {
+        self.free.push(self.pages[page as usize] & !FLAGS);
+        self.pages[page as usize] = 0;
+    }
+
     #[inline(always)]
-    fn region(&self, addr: u32, len: u32) -> (usize, usize) {
-        let i = self.pages[(addr / PAGE) as usize] as usize;
-        if i != 0 {
-            let r = &self.regions[i - 1];
-            let off = (addr - r.start) as usize;
-            if off + len as usize <= r.data.len() {
-                return (i - 1, off);
+    fn read(&self, addr: u32, size: u32) -> u32 {
+        // Aligned words and bytes never cross a page boundary.
+        let e = self.pages[(addr / PAGE) as usize];
+        let o = ((e & !FLAGS) | (addr & FLAGS)) as usize;
+        match size {
+            4 if e & MAPPED != 0 && addr % 4 == 0 => self.mem[o / 4],
+            1 if e & MAPPED != 0 => self.byte(o) as u32,
+            _ => self.read_slow(addr, size),
+        }
+    }
+
+    /// The byte at offset `o` of `mem`.
+    #[inline(always)]
+    fn byte(&self, o: usize) -> u8 {
+        (self.mem[o / 4] >> (o % 4 * 8)) as u8
+    }
+
+    #[inline(always)]
+    fn set_byte(&mut self, o: usize, b: u8) {
+        let shift = o % 4 * 8;
+        let w = &mut self.mem[o / 4];
+        *w = (*w & !(0xff << shift)) | ((b as u32) << shift);
+    }
+
+    /// Reads a value one byte at a time, or panics on unmapped memory.
+    #[cold]
+    #[inline(never)]
+    fn read_slow(&self, addr: u32, size: u32) -> u32 {
+        (0..size).rev().fold(0, |v, i| {
+            let a = addr.wrapping_add(i);
+            let e = self.pages[(a / PAGE) as usize];
+            assert!(e & MAPPED != 0, "access to unmapped memory at {a:#x}");
+            (v << 8) | self.byte(((e & !FLAGS) + (a & FLAGS)) as usize) as u32
+        })
+    }
+
+    #[inline(always)]
+    fn write(&mut self, addr: u32, size: u32, val: u32) {
+        let e = self.pages[(addr / PAGE) as usize];
+        let o = ((e & !FLAGS) | (addr & FLAGS)) as usize;
+        let plain = e & (MAPPED | WRITABLE | CODE) == MAPPED | WRITABLE;
+        match size {
+            4 if plain && addr % 4 == 0 => self.mem[o / 4] = val,
+            1 if plain => self.set_byte(o, val as u8),
+            _ => self.write_slow(addr, &val.to_le_bytes()[..size as usize]),
+        }
+    }
+
+    /// Writes bytes one at a time, invalidating decoded instructions they
+    /// overlap, or panics on unmapped or read-only memory.
+    #[cold]
+    #[inline(never)]
+    fn write_slow(&mut self, addr: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            let a = addr.wrapping_add(i as u32);
+            let e = self.pages[(a / PAGE) as usize];
+            assert!(e & MAPPED != 0, "access to unmapped memory at {a:#x}");
+            assert!(e & WRITABLE != 0, "write to read-only memory at {a:#x}");
+            self.set_byte(((e & !FLAGS) + (a & FLAGS)) as usize, *b);
+            if e & CODE != 0 {
+                // An x86 instruction is at most 15 bytes long.
+                let off = (a - self.code_start) as usize;
+                let hi = off.min(self.decoded.len() - 1);
+                self.decoded[off.saturating_sub(14)..=hi].fill(0);
             }
         }
-        panic!("access to unmapped memory at {addr:#x}");
     }
 
-    fn map_pages(&mut self, i: usize) {
-        let r = &self.regions[i];
-        let first = (r.start / PAGE) as usize;
-        let n = r.data.len() / PAGE as usize;
-        self.pages[first..first + n].fill(i as u8 + 1);
-    }
-
-    fn read(&self, addr: u32, size: u32) -> u32 {
-        let (i, off) = self.region(addr, size);
-        let d = &self.regions[i].data;
-        match size {
-            4 => u32::from_le_bytes(d[off..off + 4].try_into().unwrap()),
-            2 => u16::from_le_bytes(d[off..off + 2].try_into().unwrap()) as u32,
-            _ => d[off] as u32,
+    fn read_bytes(&self, addr: u32, len: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(len as usize);
+        while bytes.len() < len as usize {
+            let a = addr.wrapping_add(bytes.len() as u32);
+            let e = self.pages[(a / PAGE) as usize];
+            assert!(e & MAPPED != 0, "access to unmapped memory at {a:#x}");
+            let n = (len as usize - bytes.len()).min((PAGE - (a & FLAGS)) as usize);
+            let o = ((e & !FLAGS) + (a & FLAGS)) as usize;
+            bytes.extend((o..o + n).map(|o| self.byte(o)));
         }
-    }
-
-    fn write(&mut self, addr: u32, size: u32, val: u32) {
-        let bytes = val.to_le_bytes();
-        self.write_bytes(addr, &bytes[..size as usize]);
-    }
-
-    fn read_bytes(&self, addr: u32, len: u32) -> &[u8] {
-        let (i, off) = self.region(addr, len);
-        &self.regions[i].data[off..off + len as usize]
+        bytes
     }
 
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) {
-        let (i, off) = self.region(addr, bytes.len() as u32);
-        let r = &mut self.regions[i];
-        assert!(r.writable, "write to read-only memory at {addr:#x}");
-        r.data[off..off + bytes.len()].copy_from_slice(bytes);
-        // An x86 instruction is at most 15 bytes long.
-        if off + bytes.len() > r.code.0 && off <= r.code.1 + 14 {
-            r.decoded[off.saturating_sub(14)..off + bytes.len()].fill(0);
+        let mut done = 0;
+        while done < bytes.len() {
+            let a = addr.wrapping_add(done as u32);
+            let e = self.pages[(a / PAGE) as usize];
+            let n = (bytes.len() - done).min((PAGE - (a & FLAGS)) as usize);
+            if e & (MAPPED | WRITABLE | CODE) == MAPPED | WRITABLE {
+                let o = ((e & !FLAGS) + (a & FLAGS)) as usize;
+                for (i, b) in bytes[done..done + n].iter().enumerate() {
+                    self.set_byte(o + i, *b);
+                }
+            } else {
+                self.write_slow(a, &bytes[done..done + n]);
+            }
+            done += n;
         }
     }
 
@@ -559,21 +767,29 @@ impl Machine {
     /// it is not cached.
     #[inline(always)]
     fn decode(&mut self, ops: &mut Vec<Op>) -> usize {
-        let (i, off) = self.region(self.eip, 1);
-        if let Some(&n) = self.regions[i].decoded.get(off) {
+        let off = self.eip.wrapping_sub(self.code_start) as usize;
+        if let Some(&n) = self.decoded.get(off) {
             if n != 0 {
                 return n as usize - 1;
             }
         }
-        self.decode_new(ops, i, off)
+        self.decode_new(ops)
     }
 
     #[cold]
     #[inline(never)]
-    fn decode_new(&mut self, ops: &mut Vec<Op>, i: usize, off: usize) -> usize {
-        let data = &self.regions[i].data;
-        let code = &data[off..(off + 15).min(data.len())];
-        let ins = Decoder::with_ip(32, code, self.eip as u64, DecoderOptions::NONE).decode();
+    fn decode_new(&mut self, ops: &mut Vec<Op>) -> usize {
+        let mut code = [0u8; 15];
+        let mut len = 0;
+        while len < 15
+            && self.pages[(self.eip.wrapping_add(len as u32) / PAGE) as usize] & MAPPED != 0
+        {
+            code[len] = self.read(self.eip.wrapping_add(len as u32), 1) as u8;
+            len += 1;
+        }
+        assert!(len > 0, "access to unmapped memory at {:#x}", self.eip);
+        let ins =
+            Decoder::with_ip(32, &code[..len], self.eip as u64, DecoderOptions::NONE).decode();
         assert!(!ins.is_invalid(), "invalid instruction at {:#x}", self.eip);
         assert!(
             !ins.has_lock_prefix() && !ins.has_rep_prefix() && !ins.has_repne_prefix(),
@@ -581,10 +797,12 @@ impl Machine {
             self.eip
         );
         ops.push(Op::translate(&ins));
-        let r = &mut self.regions[i];
-        if let Some(slot) = r.decoded.get_mut(off) {
-            *slot = ops.len() as u32;
-            r.code = (r.code.0.min(off), r.code.1.max(off));
+        let off = self.eip.wrapping_sub(self.code_start) as usize;
+        if off < self.decoded.len() {
+            self.decoded[off] = ops.len() as u32;
+            for a in [self.eip, self.eip + ins.len() as u32 - 1] {
+                self.pages[(a / PAGE) as usize] |= CODE;
+            }
         }
         ops.len() - 1
     }
@@ -691,6 +909,124 @@ impl Machine {
                 self.read_op(ins, 0, 4)
             }
         }
+    }
+
+    #[inline(always)]
+    fn cond(&self, c: Cond) -> bool {
+        match c {
+            Cond::O => self.of,
+            Cond::No => !self.of,
+            Cond::B => self.cf,
+            Cond::Ae => !self.cf,
+            Cond::E => self.zf,
+            Cond::Ne => !self.zf,
+            Cond::Be => self.cf || self.zf,
+            Cond::A => !self.cf && !self.zf,
+            Cond::S => self.sf,
+            Cond::Ns => !self.sf,
+            Cond::L => self.sf != self.of,
+            Cond::Ge => self.sf == self.of,
+            Cond::Le => self.zf || self.sf != self.of,
+            Cond::G => !self.zf && self.sf == self.of,
+        }
+    }
+
+    #[inline(always)]
+    fn add_flags(&mut self, a: u32, b: u32, size: u32) -> u32 {
+        let res = a.wrapping_add(b) & mask(size);
+        self.cf = res < a;
+        self.of = (a ^ res) & (b ^ res) & msb(size) != 0;
+        self.set_zs(res, size);
+        res
+    }
+
+    #[inline(always)]
+    fn sub_flags(&mut self, a: u32, b: u32, size: u32) -> u32 {
+        let res = a.wrapping_sub(b) & mask(size);
+        self.cf = a < b;
+        self.of = (a ^ b) & (a ^ res) & msb(size) != 0;
+        self.set_zs(res, size);
+        res
+    }
+
+    #[inline(always)]
+    fn byte_reg(&self, index: u8, shift: u8) -> u32 {
+        (self.regs[(index & 7) as usize] >> shift) & 0xff
+    }
+
+    #[inline(always)]
+    fn set_byte_reg(&mut self, index: u8, shift: u8, v: u32) {
+        let r = &mut self.regs[(index & 7) as usize];
+        *r = (*r & !(0xff << shift)) | ((v & 0xff) << shift);
+    }
+
+    /// Executes the instruction if it has a specialized form, with the same
+    /// semantics as `execute`. Returns false for generic instructions.
+    #[inline(always)]
+    fn execute_fast(&mut self, op: &Op) -> bool {
+        let r = |i: u8| (i & 7) as usize;
+        match op.fast {
+            Fast::Generic => return false,
+            Fast::MovRR(d, s) => self.regs[r(d)] = self.regs[r(s)],
+            Fast::MovRI(d, v) => self.regs[r(d)] = v,
+            Fast::MovRM(d) => self.regs[r(d)] = self.read(self.addr(op.args[1]), 4),
+            Fast::MovMR(s) => self.write(self.addr(op.args[0]), 4, self.regs[r(s)]),
+            Fast::MovB8M(i, sh) => {
+                let v = self.read(self.addr(op.args[1]), 1);
+                self.set_byte_reg(i, sh, v);
+            }
+            Fast::MovMB8(i, sh) => self.write(self.addr(op.args[0]), 1, self.byte_reg(i, sh)),
+            Fast::MovzxRB8(d, i, sh) => self.regs[r(d)] = self.byte_reg(i, sh),
+            Fast::MovzxRM8(d) => self.regs[r(d)] = self.read(self.addr(op.args[1]), 1),
+            Fast::Lea(d) => self.regs[r(d)] = self.addr(op.args[1]),
+            Fast::PushR(s) => self.push(self.regs[r(s)]),
+            Fast::PopR(d) => {
+                // `pop esp` loads the value read at the old esp.
+                let v = self.pop();
+                self.regs[r(d)] = v;
+            }
+            Fast::AddRI(d, v) => self.regs[r(d)] = self.add_flags(self.regs[r(d)], v, 4),
+            Fast::AddRR(d, s) => {
+                self.regs[r(d)] = self.add_flags(self.regs[r(d)], self.regs[r(s)], 4)
+            }
+            Fast::SubRI(d, v) => self.regs[r(d)] = self.sub_flags(self.regs[r(d)], v, 4),
+            Fast::SubRR(d, s) => {
+                self.regs[r(d)] = self.sub_flags(self.regs[r(d)], self.regs[r(s)], 4)
+            }
+            Fast::CmpRI(d, v) => {
+                self.sub_flags(self.regs[r(d)], v, 4);
+            }
+            Fast::CmpRR(d, s) => {
+                self.sub_flags(self.regs[r(d)], self.regs[r(s)], 4);
+            }
+            Fast::TestRR(d, s) => {
+                self.cf = false;
+                self.of = false;
+                self.set_zs(self.regs[r(d)] & self.regs[r(s)], 4);
+            }
+            Fast::CmpB8B8(i, sh, j, sh2) => {
+                self.sub_flags(self.byte_reg(i, sh), self.byte_reg(j, sh2), 1);
+            }
+            Fast::CmpB8I(i, sh, v) => {
+                self.sub_flags(self.byte_reg(i, sh), v, 1);
+            }
+            Fast::Jcc(c, t) => {
+                if self.cond(c) {
+                    self.eip = t;
+                }
+            }
+            Fast::Jmp(t) => self.eip = t,
+            Fast::Call(t) => {
+                self.push(self.eip);
+                self.eip = t;
+            }
+            Fast::Ret => self.eip = self.pop(),
+            Fast::Setcc(c, i, sh) => {
+                let v = self.cond(c) as u32;
+                self.set_byte_reg(i, sh, v);
+            }
+        }
+        true
     }
 
     /// Executes one instruction whose eip has already been advanced. Returns
@@ -1019,7 +1355,7 @@ impl Machine {
                 if data.len() < pos + chunk.len() {
                     data.resize(pos + chunk.len(), 0);
                 }
-                data[pos..pos + chunk.len()].copy_from_slice(chunk);
+                data[pos..pos + chunk.len()].copy_from_slice(&chunk);
                 edx as i32
             }
             // open(path, flags, mode)
@@ -1136,18 +1472,16 @@ impl Machine {
             }
             // brk(addr): returns the new break, or the old one on failure.
             45 => {
-                let heap = &mut self.regions[self.heap];
-                if ebx >= heap.start && ebx <= HEAP_LIMIT {
+                if ebx >= self.brk_start && ebx <= HEAP_LIMIT {
                     // Pages above the break are unmapped, so they read as
                     // zero if the break grows again.
-                    let old_end = (heap.start as usize + heap.data.len()) / PAGE as usize;
-                    heap.data
-                        .resize((ebx.next_multiple_of(PAGE) - heap.start) as usize, 0);
-                    let new_end = (heap.start as usize + heap.data.len()) / PAGE as usize;
-                    if new_end < old_end {
-                        self.pages[new_end..old_end].fill(0);
-                    } else {
-                        self.pages[old_end..new_end].fill(self.heap as u8 + 1);
+                    let old_end = self.brk.next_multiple_of(PAGE) / PAGE;
+                    let new_end = ebx.next_multiple_of(PAGE) / PAGE;
+                    for page in new_end..old_end {
+                        self.unmap(page);
+                    }
+                    for page in old_end..new_end {
+                        self.map(page, WRITABLE);
                     }
                     self.brk = ebx;
                 }
