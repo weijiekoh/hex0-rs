@@ -1,5 +1,5 @@
-//! Runs the first steps of StageX's x86 bootstrap in the zkVM, starting from
-//! the hex0 seed, and checks that the steps link by hash.
+//! Runs StageX's x86 stage0 build in the zkVM, starting from the hex0 seed,
+//! and checks that the steps link by hash.
 //!
 //! ```shell
 //! cargo run --release --bin stagex -- --execute
@@ -7,14 +7,12 @@
 //! ```
 
 use clap::Parser;
-use hex0_lib::stagex::{
-    run_step, sha256, StepClaim, StepInputs, SEED_PATH, SEED_SHA256, SOURCES_DIR, STEPS,
-};
+use hex0_lib::stagex::{Chain, StepClaim, SEED_SHA256, SUPPORTED_STEPS};
 use sp1_sdk::{
     blocking::{ProveRequest, Prover, ProverClient},
     include_elf, Elf, ProvingKey, SP1Stdin,
 };
-use std::collections::BTreeMap;
+use std::path::Path;
 
 pub const STAGEX_X86_ELF: Elf = include_elf!("stagex-x86-program");
 
@@ -26,7 +24,11 @@ struct Args {
     #[arg(long)]
     prove: bool,
 
-    /// Where to write each step's output binary and, with --prove, its proof.
+    /// How many steps to run, from the seed.
+    #[arg(long, default_value_t = SUPPORTED_STEPS)]
+    steps: usize,
+
+    /// Where to write proofs, with --prove.
     #[arg(long, default_value = "stagex-out")]
     out_dir: String,
 }
@@ -41,6 +43,12 @@ fn main() {
     }
     std::fs::create_dir_all(&args.out_dir).expect("failed to create output directory");
 
+    // SP1's default gas trace chunk makes the executor map about 4.7 GB of
+    // shared memory; a smaller chunk fits small machines and does not change
+    // cycle counts.
+    if std::env::var_os("GAS_TRACE_CHUNK_THRESHOLD").is_none() {
+        std::env::set_var("GAS_TRACE_CHUNK_THRESHOLD", "4194304");
+    }
     // The light prover executes without initializing the full prover.
     let light = args
         .execute
@@ -51,45 +59,23 @@ fn main() {
         (client, pk)
     });
 
-    let seed = std::fs::read(SEED_PATH).expect("failed to read the seed");
-    assert_eq!(
-        hex::encode(sha256(&seed)),
-        SEED_SHA256,
-        "seed hash mismatch"
-    );
-
-    // Binaries available to later steps, and the hashes a verifier trusts.
-    let mut artifacts = BTreeMap::from([("hex0-seed".to_string(), seed)]);
-    let mut known = BTreeMap::from([("hex0-seed".to_string(), sha256(&artifacts["hex0-seed"]))]);
-
-    for step in STEPS {
-        let [tool, input, output] = step.argv;
-        let tool = tool.trim_start_matches(['.', '/']);
-        let source_path = format!("{SOURCES_DIR}/{}", input.strip_prefix("/x86/").unwrap());
-        let source = std::fs::read(&source_path).expect("failed to read source");
-        let inputs = StepInputs {
-            tool: artifacts[tool].clone(),
-            argv: step.argv.map(String::from).to_vec(),
-            files: vec![(input.to_string(), source.clone())],
-        };
-
-        // Run natively to obtain the output binary for the next step.
-        let (_, created) = run_step(&inputs);
+    let mut chain = Chain::new(Path::new("."));
+    for (i, argv) in chain.steps().into_iter().take(args.steps).enumerate() {
+        let step = i + 1;
+        // Run natively to find the step's inputs and its output files.
+        let prepared = chain.prepare(&argv);
 
         let mut stdin = SP1Stdin::new();
-        stdin.write(&inputs);
-        let mut public_values = if args.execute {
-            let (public_values, report) = light
-                .as_ref()
-                .unwrap()
-                .execute(STAGEX_X86_ELF, stdin)
-                .run()
-                .unwrap();
+        stdin.write(&prepared.inputs);
+        let mut public_values = if let Some(light) = &light {
+            let (public_values, report) = light.execute(STAGEX_X86_ELF, stdin).run().unwrap();
             // A guest panic is reported as an exit code.
-            assert_eq!(report.exit_code, 0, "{output}: guest panicked");
+            assert_eq!(report.exit_code, 0, "step {step}: guest panicked");
             println!(
-                "{output}: executed in {} cycles",
-                report.total_instruction_count()
+                "step {step}: {} x86 instructions, {} cycles: {}",
+                prepared.instructions,
+                report.total_instruction_count(),
+                argv.join(" ")
             );
             public_values
         } else {
@@ -102,39 +88,13 @@ fn main() {
                 .verify(&proof, pk.verifying_key(), None)
                 .expect("failed to verify proof");
             proof
-                .save(format!("{}/{output}.proof", args.out_dir))
+                .save(format!("{}/step-{step:02}.proof", args.out_dir))
                 .expect("failed to save proof");
-            println!("{output}: proved and verified");
+            println!("step {step}: proved and verified: {}", argv.join(" "));
             std::mem::take(&mut proof.public_values)
         };
         let claim: StepClaim = public_values.read();
-
-        // The checks a verifier makes: the tool is the seed or an earlier
-        // step's output, the input is the pinned source, and the output is
-        // what a real StageX build produces.
-        assert_eq!(claim.argv, step.argv.map(String::from).to_vec());
-        assert_eq!(
-            claim.tool_sha256, known[tool],
-            "{output}: tool is not a known binary"
-        );
-        assert_eq!(claim.inputs, vec![(input.to_string(), sha256(&source))]);
-        assert_eq!(
-            claim.outputs.len(),
-            1,
-            "{output}: expected exactly one output file"
-        );
-        assert_eq!(claim.outputs[0].0, output);
-        assert_eq!(
-            hex::encode(claim.outputs[0].1),
-            step.output_sha256,
-            "{output}: hash mismatch"
-        );
-        known.insert(output.to_string(), claim.outputs[0].1);
-
-        let bytes = created.into_iter().next().unwrap().1;
-        std::fs::write(format!("{}/{output}", args.out_dir), &bytes)
-            .expect("failed to write output");
-        artifacts.insert(output.to_string(), bytes);
+        chain.accept(&argv, &claim, prepared.created);
     }
     println!("All steps link from the seed {SEED_SHA256}.");
 }

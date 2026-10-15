@@ -12,19 +12,23 @@ use std::collections::BTreeMap;
 
 const PAGE: u32 = 0x1000;
 const STACK_TOP: u32 = 0xC000_0000;
-const STACK_SIZE: u32 = 0x2_0000;
+const STACK_SIZE: u32 = 0x80_0000;
+/// The heap may grow up to this far below the stack.
+const HEAP_LIMIT: u32 = 0x8000_0000;
 
 const EAX: usize = 0;
 const EDX: usize = 2;
 const ESP: usize = 4;
 
 const O_WRONLY_CREAT_TRUNC: u32 = 0o1101;
-const ENOENT: i32 = 2;
 
 /// The result of running a program to completion.
 pub struct Exit {
+    /// The exit status, as the parent process would see it.
     pub code: u32,
-    /// Files the program created, by path.
+    /// Files the program loaded through `lookup`, by canonical path.
+    pub loaded: Vec<String>,
+    /// Files the program created, by canonical path.
     pub created: BTreeMap<String, Vec<u8>>,
     /// Number of x86 instructions executed.
     pub instructions: u64,
@@ -34,15 +38,129 @@ struct Region {
     start: u32,
     data: Vec<u8>,
     writable: bool,
-    /// Decoded instructions by offset, for segments loaded from the ELF.
-    /// Writes invalidate the entries they may overlap.
-    decoded: Vec<Option<Instruction>>,
+    /// For segments loaded from the ELF, the decoded instruction at each
+    /// offset, as an index into the op arena plus one, or 0. Writes
+    /// invalidate the entries they may overlap.
+    decoded: Vec<u32>,
+    /// Offsets of the lowest and highest decoded instructions, so that
+    /// writes elsewhere can skip invalidation.
+    code: (usize, usize),
+}
+
+/// An operand with its registers and size already resolved.
+#[derive(Clone, Copy)]
+enum Arg {
+    None,
+    Reg {
+        index: u8,
+        shift: u8,
+    },
+    /// `[base + index << scale + disp]`, where a register number of 8 means
+    /// none.
+    Mem {
+        base: u8,
+        index: u8,
+        scale: u8,
+        disp: u32,
+    },
+    Imm(u32),
+    Branch(u32),
+}
+
+/// A decoded instruction in the form the executor uses.
+#[derive(Clone, Copy)]
+struct Op {
+    mnemonic: Mnemonic,
+    next_ip: u32,
+    count: u8,
+    sizes: [u8; 3],
+    args: [Arg; 3],
+}
+
+impl Op {
+    fn mnemonic(&self) -> Mnemonic {
+        self.mnemonic
+    }
+
+    fn op_count(&self) -> u32 {
+        self.count as u32
+    }
+
+    fn translate(ins: &Instruction) -> Op {
+        let count = ins.op_count().min(3);
+        let mut op = Op {
+            mnemonic: ins.mnemonic(),
+            next_ip: ins.next_ip32(),
+            count: count as u8,
+            sizes: [0; 3],
+            args: [Arg::None; 3],
+        };
+        for i in 0..count {
+            let (arg, size) = match ins.op_kind(i) {
+                OpKind::Register => {
+                    let (index, size, shift) = reg_info(ins.op_register(i));
+                    (
+                        Arg::Reg {
+                            index: index as u8,
+                            shift: shift as u8,
+                        },
+                        size,
+                    )
+                }
+                OpKind::Memory => {
+                    assert!(
+                        matches!(
+                            ins.memory_segment(),
+                            Register::DS | Register::SS | Register::ES
+                        ),
+                        "unsupported segment {:?}",
+                        ins.memory_segment()
+                    );
+                    let reg = |r: Register| match r {
+                        Register::None => 8,
+                        r => {
+                            let (index, size, _) = reg_info(r);
+                            assert_eq!(size, 4, "unsupported address register {r:?}");
+                            index as u8
+                        }
+                    };
+                    let arg = Arg::Mem {
+                        base: reg(ins.memory_base()),
+                        index: reg(ins.memory_index()),
+                        scale: ins.memory_index_scale().trailing_zeros() as u8,
+                        disp: ins.memory_displacement32(),
+                    };
+                    let size = if ins.mnemonic() == Mnemonic::Lea {
+                        4
+                    } else {
+                        mem_size(ins.memory_size())
+                    };
+                    (arg, size)
+                }
+                OpKind::Immediate8
+                | OpKind::Immediate16
+                | OpKind::Immediate32
+                | OpKind::Immediate8to16
+                | OpKind::Immediate8to32 => {
+                    // An immediate takes the size of the first operand.
+                    let size = if i == 0 { 4 } else { op.sizes[0] as u32 };
+                    (Arg::Imm(ins.immediate(i) as u32 & mask(size)), size)
+                }
+                OpKind::NearBranch32 => (Arg::Branch(ins.near_branch32()), 4),
+                k => panic!("unsupported operand kind {k:?}"),
+            };
+            op.args[i as usize] = arg;
+            op.sizes[i as usize] = size as u8;
+        }
+        op
+    }
 }
 
 struct File {
     path: String,
     data: Vec<u8>,
     created: bool,
+    loaded: bool,
 }
 
 struct OpenFile {
@@ -51,8 +169,17 @@ struct OpenFile {
     writable: bool,
 }
 
-struct Machine {
+struct Machine<'a> {
     regions: Vec<Region>,
+    /// For each 4 KiB page of the address space, the index of the region
+    /// that maps it plus one, or 0.
+    pages: Vec<u8>,
+    /// Index of the heap region in `regions`; its end is the program break.
+    heap: usize,
+    /// The program break, which may lie inside the heap's last page.
+    brk: u32,
+    cwd: String,
+    lookup: &'a mut dyn FnMut(&str) -> Option<Vec<u8>>,
     regs: [u32; 8],
     eip: u32,
     cf: bool,
@@ -63,19 +190,35 @@ struct Machine {
     fds: Vec<Option<OpenFile>>,
 }
 
-/// Runs a static i386 Linux ELF with the given argv. `files` is the
-/// filesystem the program can open for reading.
-pub fn run(elf: &[u8], argv: &[String], files: BTreeMap<String, Vec<u8>>) -> Exit {
-    let mut m = Machine::load(elf, argv, files);
+/// Runs a static i386 Linux ELF with the given argv in the working directory
+/// `cwd`. When the program opens a file it has not created, `lookup` is called
+/// with its canonical path; opening a file that does not exist panics.
+pub fn run(
+    elf: &[u8],
+    argv: &[String],
+    cwd: &str,
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Exit {
+    let mut m = Machine::load(elf, argv, cwd, lookup);
+    // Decoded instructions live outside the machine so that executing one
+    // borrows it instead of copying it.
+    let mut ops = Vec::new();
     let mut instructions = 0u64;
     let code = loop {
-        let ins = m.decode();
-        m.eip = ins.next_ip32();
+        let index = m.decode(&mut ops);
+        let op = &ops[index];
+        m.eip = op.next_ip;
         instructions += 1;
-        if let Some(code) = m.execute(&ins) {
+        if let Some(code) = m.execute(op) {
             break code;
         }
     };
+    let loaded = m
+        .files
+        .iter()
+        .filter(|f| f.loaded)
+        .map(|f| f.path.clone())
+        .collect();
     let created = m
         .files
         .into_iter()
@@ -83,10 +226,31 @@ pub fn run(elf: &[u8], argv: &[String], files: BTreeMap<String, Vec<u8>>) -> Exi
         .map(|f| (f.path, f.data))
         .collect();
     Exit {
-        code,
+        code: code & 0xff,
+        loaded,
         created,
         instructions,
     }
+}
+
+/// Resolves `path` against `cwd`, removing `.` and `..` components.
+pub fn canonical(cwd: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let full = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{cwd}/{path}")
+    };
+    for part in full.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 fn u16_at(b: &[u8], off: usize) -> u32 {
@@ -151,10 +315,15 @@ fn mem_size(ms: MemorySize) -> u32 {
     }
 }
 
-impl Machine {
+impl<'a> Machine<'a> {
     /// Loads the ELF and sets up the initial process state the way Linux does
     /// for a static i386 executable.
-    fn load(elf: &[u8], argv: &[String], files: BTreeMap<String, Vec<u8>>) -> Machine {
+    fn load(
+        elf: &[u8],
+        argv: &[String],
+        cwd: &str,
+        lookup: &'a mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    ) -> Machine<'a> {
         assert!(
             elf.len() >= 0x34 && elf[..4] == *b"\x7fELF",
             "not an ELF file"
@@ -205,37 +374,54 @@ impl Machine {
             }
             regions.push(Region {
                 start,
-                decoded: vec![None; data.len()],
+                decoded: vec![0; data.len()],
+                code: (usize::MAX, 0),
                 data,
                 writable: flags & 2 != 0,
             });
         }
 
+        // The program break starts at the page after the last segment.
+        let brk_start = regions
+            .iter()
+            .map(|r| r.start + r.data.len() as u32)
+            .max()
+            .unwrap();
         regions.push(Region {
             start: STACK_TOP - STACK_SIZE,
             data: vec![0u8; STACK_SIZE as usize],
             writable: true,
             decoded: Vec::new(),
+            code: (usize::MAX, 0),
+        });
+        regions.push(Region {
+            start: brk_start,
+            data: Vec::new(),
+            writable: true,
+            decoded: Vec::new(),
+            code: (usize::MAX, 0),
         });
 
         let mut m = Machine {
+            pages: vec![0; (1 << 32) / PAGE as usize],
+            heap: regions.len() - 1,
+            brk: brk_start,
             regions,
+            cwd: cwd.to_string(),
+            lookup,
             regs: [0; 8],
             eip: entry,
             cf: false,
             zf: false,
             sf: false,
             of: false,
-            files: files
-                .into_iter()
-                .map(|(path, data)| File {
-                    path,
-                    data,
-                    created: false,
-                })
-                .collect(),
+            files: Vec::new(),
             fds: Vec::new(),
         };
+
+        for i in 0..m.regions.len() {
+            m.map_pages(i);
+        }
 
         // Initial stack: argc, argv pointers, NULL, an empty environment and
         // an auxiliary vector holding only AT_NULL. All registers start at 0.
@@ -259,20 +445,34 @@ impl Machine {
         m
     }
 
+    #[inline(always)]
     fn region(&self, addr: u32, len: u32) -> (usize, usize) {
-        for (i, r) in self.regions.iter().enumerate() {
-            let off = addr.wrapping_sub(r.start) as usize;
-            if addr >= r.start && off <= r.data.len() && len as usize <= r.data.len() - off {
-                return (i, off);
+        let i = self.pages[(addr / PAGE) as usize] as usize;
+        if i != 0 {
+            let r = &self.regions[i - 1];
+            let off = (addr - r.start) as usize;
+            if off + len as usize <= r.data.len() {
+                return (i - 1, off);
             }
         }
         panic!("access to unmapped memory at {addr:#x}");
     }
 
+    fn map_pages(&mut self, i: usize) {
+        let r = &self.regions[i];
+        let first = (r.start / PAGE) as usize;
+        let n = r.data.len() / PAGE as usize;
+        self.pages[first..first + n].fill(i as u8 + 1);
+    }
+
     fn read(&self, addr: u32, size: u32) -> u32 {
         let (i, off) = self.region(addr, size);
-        let bytes = &self.regions[i].data[off..off + size as usize];
-        bytes.iter().rev().fold(0, |v, b| (v << 8) | *b as u32)
+        let d = &self.regions[i].data;
+        match size {
+            4 => u32::from_le_bytes(d[off..off + 4].try_into().unwrap()),
+            2 => u16::from_le_bytes(d[off..off + 2].try_into().unwrap()) as u32,
+            _ => d[off] as u32,
+        }
     }
 
     fn write(&mut self, addr: u32, size: u32, val: u32) {
@@ -290,17 +490,28 @@ impl Machine {
         let r = &mut self.regions[i];
         assert!(r.writable, "write to read-only memory at {addr:#x}");
         r.data[off..off + bytes.len()].copy_from_slice(bytes);
-        if !r.decoded.is_empty() {
-            // An x86 instruction is at most 15 bytes long.
-            r.decoded[off.saturating_sub(14)..off + bytes.len()].fill(None);
+        // An x86 instruction is at most 15 bytes long.
+        if off + bytes.len() > r.code.0 && off <= r.code.1 + 14 {
+            r.decoded[off.saturating_sub(14)..off + bytes.len()].fill(0);
         }
     }
 
-    fn decode(&mut self) -> Instruction {
+    /// Returns the index in `ops` of the instruction at eip, decoding it if
+    /// it is not cached.
+    #[inline(always)]
+    fn decode(&mut self, ops: &mut Vec<Op>) -> usize {
         let (i, off) = self.region(self.eip, 1);
-        if let Some(Some(ins)) = self.regions[i].decoded.get(off) {
-            return *ins;
+        if let Some(&n) = self.regions[i].decoded.get(off) {
+            if n != 0 {
+                return n as usize - 1;
+            }
         }
+        self.decode_new(ops, i, off)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode_new(&mut self, ops: &mut Vec<Op>, i: usize, off: usize) -> usize {
         let data = &self.regions[i].data;
         let code = &data[off..(off + 15).min(data.len())];
         let ins = Decoder::with_ip(32, code, self.eip as u64, DecoderOptions::NONE).decode();
@@ -310,70 +521,67 @@ impl Machine {
             "unsupported prefix at {:#x}",
             self.eip
         );
-        if let Some(slot) = self.regions[i].decoded.get_mut(off) {
-            *slot = Some(ins);
+        ops.push(Op::translate(&ins));
+        let r = &mut self.regions[i];
+        if let Some(slot) = r.decoded.get_mut(off) {
+            *slot = ops.len() as u32;
+            r.code = (r.code.0.min(off), r.code.1.max(off));
         }
-        ins
+        ops.len() - 1
     }
 
-    fn get_reg(&self, r: Register) -> u32 {
-        let (i, size, shift) = reg_info(r);
-        (self.regs[i] >> shift) & mask(size)
-    }
-
-    fn set_reg(&mut self, r: Register, v: u32) {
-        let (i, size, shift) = reg_info(r);
-        let m = mask(size) << shift;
-        self.regs[i] = (self.regs[i] & !m) | ((v << shift) & m);
-    }
-
-    fn ea(&self, ins: &Instruction) -> u32 {
-        assert!(
-            matches!(
-                ins.memory_segment(),
-                Register::DS | Register::SS | Register::ES
-            ),
-            "unsupported segment {:?}",
-            ins.memory_segment()
-        );
-        let base = match ins.memory_base() {
-            Register::None => 0,
-            r => self.get_reg(r),
+    fn addr(&self, arg: Arg) -> u32 {
+        let Arg::Mem {
+            base,
+            index,
+            scale,
+            disp,
+        } = arg
+        else {
+            unreachable!()
         };
-        let index = match ins.memory_index() {
-            Register::None => 0,
-            r => self.get_reg(r).wrapping_mul(ins.memory_index_scale()),
-        };
-        base.wrapping_add(index)
-            .wrapping_add(ins.memory_displacement32())
+        let mut a = disp;
+        if base < 8 {
+            a = a.wrapping_add(self.regs[base as usize]);
+        }
+        if index < 8 {
+            a = a.wrapping_add(self.regs[index as usize] << scale);
+        }
+        a
     }
 
-    fn op_size(&self, ins: &Instruction, i: u32) -> u32 {
-        match ins.op_kind(i) {
-            OpKind::Register => reg_info(ins.op_register(i)).1,
-            OpKind::Memory => mem_size(ins.memory_size()),
-            k => panic!("unsupported operand kind {k:?}"),
+    /// The address of the instruction's memory operand.
+    fn ea(&self, ins: &Op) -> u32 {
+        let arg = ins
+            .args
+            .into_iter()
+            .find(|a| matches!(a, Arg::Mem { .. }))
+            .unwrap();
+        self.addr(arg)
+    }
+
+    fn op_size(&self, ins: &Op, i: u32) -> u32 {
+        ins.sizes[i as usize] as u32
+    }
+
+    fn read_op(&self, ins: &Op, i: u32, size: u32) -> u32 {
+        match ins.args[i as usize] {
+            Arg::Reg { index, shift } => (self.regs[index as usize] >> shift) & mask(size),
+            arg @ Arg::Mem { .. } => self.read(self.addr(arg), size),
+            Arg::Imm(v) => v & mask(size),
+            _ => panic!("unsupported operand"),
         }
     }
 
-    fn read_op(&self, ins: &Instruction, i: u32, size: u32) -> u32 {
-        match ins.op_kind(i) {
-            OpKind::Register => self.get_reg(ins.op_register(i)),
-            OpKind::Memory => self.read(self.ea(ins), size),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32 => ins.immediate(i) as u32 & mask(size),
-            k => panic!("unsupported operand kind {k:?}"),
-        }
-    }
-
-    fn write_op(&mut self, ins: &Instruction, i: u32, size: u32, v: u32) {
-        match ins.op_kind(i) {
-            OpKind::Register => self.set_reg(ins.op_register(i), v),
-            OpKind::Memory => self.write(self.ea(ins), size, v),
-            k => panic!("unsupported operand kind {k:?}"),
+    fn write_op(&mut self, ins: &Op, i: u32, size: u32, v: u32) {
+        match ins.args[i as usize] {
+            Arg::Reg { index, shift } => {
+                let m = mask(size) << shift;
+                let r = &mut self.regs[index as usize];
+                *r = (*r & !m) | ((v << shift) & m);
+            }
+            arg @ Arg::Mem { .. } => self.write(self.addr(arg), size, v),
+            _ => panic!("unsupported operand"),
         }
     }
 
@@ -393,30 +601,42 @@ impl Machine {
         v
     }
 
-    fn condition(&self, jcc: Mnemonic) -> bool {
+    /// Evaluates the condition of a `jcc` or `setcc` instruction.
+    fn condition(&self, m: Mnemonic) -> bool {
         use Mnemonic::*;
-        match jcc {
-            Jo => self.of,
-            Jno => !self.of,
-            Jb => self.cf,
-            Jae => !self.cf,
-            Je => self.zf,
-            Jne => !self.zf,
-            Jbe => self.cf || self.zf,
-            Ja => !self.cf && !self.zf,
-            Js => self.sf,
-            Jns => !self.sf,
-            Jl => self.sf != self.of,
-            Jge => self.sf == self.of,
-            Jle => self.zf || self.sf != self.of,
-            Jg => !self.zf && self.sf == self.of,
+        match m {
+            Jo | Seto => self.of,
+            Jno | Setno => !self.of,
+            Jb | Setb => self.cf,
+            Jae | Setae => !self.cf,
+            Je | Sete => self.zf,
+            Jne | Setne => !self.zf,
+            Jbe | Setbe => self.cf || self.zf,
+            Ja | Seta => !self.cf && !self.zf,
+            Js | Sets => self.sf,
+            Jns | Setns => !self.sf,
+            Jl | Setl => self.sf != self.of,
+            Jge | Setge => self.sf == self.of,
+            Jle | Setle => self.zf || self.sf != self.of,
+            Jg | Setg => !self.zf && self.sf == self.of,
             _ => unreachable!(),
+        }
+    }
+
+    /// The target of a near `call` or `jmp`: relative, register or memory.
+    fn branch_target(&self, ins: &Op) -> u32 {
+        match ins.args[0] {
+            Arg::Branch(target) => target,
+            _ => {
+                assert_eq!(self.op_size(ins, 0), 4, "unsupported branch size");
+                self.read_op(ins, 0, 4)
+            }
         }
     }
 
     /// Executes one instruction whose eip has already been advanced. Returns
     /// the exit code if the program exited.
-    fn execute(&mut self, ins: &Instruction) -> Option<u32> {
+    fn execute(&mut self, ins: &Op) -> Option<u32> {
         use Mnemonic::*;
         match ins.mnemonic() {
             Mov => {
@@ -426,6 +646,12 @@ impl Machine {
             }
             Movzx => {
                 let v = self.read_op(ins, 1, self.op_size(ins, 1));
+                self.write_op(ins, 0, self.op_size(ins, 0), v);
+            }
+            Movsx => {
+                let size = self.op_size(ins, 1);
+                let v = self.read_op(ins, 1, size);
+                let v = (((v << (32 - 8 * size)) as i32) >> (32 - 8 * size)) as u32;
                 self.write_op(ins, 0, self.op_size(ins, 0), v);
             }
             Lea => {
@@ -535,11 +761,7 @@ impl Machine {
                 };
             }
             Push => {
-                let size = match ins.op_kind(0) {
-                    OpKind::Immediate8to32 | OpKind::Immediate32 => 4,
-                    _ => self.op_size(ins, 0),
-                };
-                assert_eq!(size, 4, "unsupported push size");
+                assert_eq!(self.op_size(ins, 0), 4, "unsupported push size");
                 let v = self.read_op(ins, 0, 4);
                 self.push(v);
             }
@@ -548,31 +770,109 @@ impl Machine {
                 let v = self.pop();
                 self.write_op(ins, 0, 4, v);
             }
+            Imul | Mul if ins.op_count() == 1 => {
+                // edx:eax = eax * r/m32
+                assert_eq!(self.op_size(ins, 0), 4, "unsupported multiply size");
+                let b = self.read_op(ins, 0, 4);
+                let (a, b) = (self.regs[EAX], b);
+                let wide = if ins.mnemonic() == Imul {
+                    (a as i32 as i64 * b as i32 as i64) as u64
+                } else {
+                    a as u64 * b as u64
+                };
+                self.regs[EAX] = wide as u32;
+                self.regs[EDX] = (wide >> 32) as u32;
+                let fits = if ins.mnemonic() == Imul {
+                    wide as i64 == wide as u32 as i32 as i64
+                } else {
+                    wide >> 32 == 0
+                };
+                self.cf = !fits;
+                self.of = !fits;
+            }
+            Imul => {
+                // r32 = r/m32 * (r32 or imm)
+                assert_eq!(self.op_size(ins, 0), 4, "unsupported multiply size");
+                let (a, b) = if ins.op_count() == 2 {
+                    (self.read_op(ins, 0, 4), self.read_op(ins, 1, 4))
+                } else {
+                    (self.read_op(ins, 1, 4), self.read_op(ins, 2, 4))
+                };
+                let wide = a as i32 as i64 * b as i32 as i64;
+                self.cf = wide != wide as i32 as i64;
+                self.of = self.cf;
+                self.write_op(ins, 0, 4, wide as u32);
+            }
+            Idiv | Div => {
+                // eax = edx:eax / r/m32, edx = remainder
+                assert_eq!(self.op_size(ins, 0), 4, "unsupported divide size");
+                let divisor = self.read_op(ins, 0, 4);
+                assert_ne!(divisor, 0, "divide by zero");
+                let dividend = ((self.regs[EDX] as u64) << 32) | self.regs[EAX] as u64;
+                let (q, r) = if ins.mnemonic() == Idiv {
+                    let (n, d) = (dividend as i64, divisor as i32 as i64);
+                    let q = n / d;
+                    assert_eq!(q, q as i32 as i64, "divide overflow");
+                    (q as u32, (n % d) as u32)
+                } else {
+                    let q = dividend / divisor as u64;
+                    assert_eq!(q >> 32, 0, "divide overflow");
+                    (q as u32, (dividend % divisor as u64) as u32)
+                };
+                self.regs[EAX] = q;
+                self.regs[EDX] = r;
+            }
+            Seto | Setno | Setb | Setae | Sete | Setne | Setbe | Seta | Sets | Setns | Setl
+            | Setge | Setle | Setg => {
+                let v = self.condition(ins.mnemonic()) as u32;
+                self.write_op(ins, 0, 1, v);
+            }
+            // PF and AF are not modelled; stage0 only saves and restores
+            // the flags around calls.
+            Pushfd => {
+                let flags = 0x202
+                    | self.cf as u32
+                    | (self.zf as u32) << 6
+                    | (self.sf as u32) << 7
+                    | (self.of as u32) << 11;
+                self.push(flags);
+            }
+            Popfd => {
+                let flags = self.pop();
+                self.cf = flags & 1 != 0;
+                self.zf = flags & 1 << 6 != 0;
+                self.sf = flags & 1 << 7 != 0;
+                self.of = flags & 1 << 11 != 0;
+            }
             Call => {
-                assert_eq!(ins.op_kind(0), OpKind::NearBranch32, "unsupported call");
+                let target = self.branch_target(ins);
                 self.push(self.eip);
-                self.eip = ins.near_branch32();
+                self.eip = target;
             }
             Ret => {
                 assert_eq!(ins.op_count(), 0, "unsupported ret");
                 self.eip = self.pop();
             }
             Jmp => {
-                assert_eq!(ins.op_kind(0), OpKind::NearBranch32, "unsupported jmp");
-                self.eip = ins.near_branch32();
+                self.eip = self.branch_target(ins);
             }
             Jo | Jno | Jb | Jae | Je | Jne | Jbe | Ja | Js | Jns | Jl | Jge | Jle | Jg => {
-                assert_eq!(ins.op_kind(0), OpKind::NearBranch32, "unsupported jcc");
+                let Arg::Branch(target) = ins.args[0] else {
+                    panic!("unsupported jcc")
+                };
                 if self.condition(ins.mnemonic()) {
-                    self.eip = ins.near_branch32();
+                    self.eip = target;
                 }
             }
             Int => {
-                assert_eq!(ins.immediate(0), 0x80, "unsupported interrupt");
+                assert!(
+                    matches!(ins.args[0], Arg::Imm(0x80)),
+                    "unsupported interrupt"
+                );
                 return self.syscall();
             }
             Nop => {}
-            m => panic!("unsupported instruction {m:?} at {:#x}", ins.ip32()),
+            m => panic!("unsupported instruction {m:?} before {:#x}", self.eip),
         }
         None
     }
@@ -591,21 +891,26 @@ impl Machine {
         String::from_utf8(bytes).expect("path is not UTF-8")
     }
 
-    fn open_file(&mut self, fd: u32, writable: bool) -> &mut OpenFile {
-        let f = fd
-            .checked_sub(3)
+    fn fd(&mut self, fd: u32) -> &mut OpenFile {
+        fd.checked_sub(3)
             .and_then(|i| self.fds.get_mut(i as usize))
             .and_then(|f| f.as_mut())
-            .unwrap_or_else(|| panic!("unsupported file descriptor {fd}"));
-        assert!(
-            !writable || f.writable,
-            "write to read-only file descriptor {fd}"
-        );
-        assert!(
-            writable || !f.writable,
-            "read from write-only file descriptor {fd}"
-        );
-        f
+            .unwrap_or_else(|| panic!("unsupported file descriptor {fd}"))
+    }
+
+    /// Finds an existing file, loading it through `lookup` if needed.
+    fn find_file(&mut self, path: &str) -> Option<usize> {
+        if let Some(i) = self.files.iter().position(|f| f.path == path) {
+            return Some(i);
+        }
+        let data = (self.lookup)(path)?;
+        self.files.push(File {
+            path: path.to_string(),
+            data,
+            created: false,
+            loaded: true,
+        });
+        Some(self.files.len() - 1)
     }
 
     /// Handles `int 0x80` using the Linux i386 system call ABI.
@@ -616,10 +921,11 @@ impl Machine {
             1 => return Some(ebx),
             // read(fd, buf, count)
             3 => {
-                let f = self.open_file(ebx, false);
+                let f = self.fd(ebx);
+                assert!(!f.writable, "read from write-only file descriptor {ebx}");
                 let (file, pos) = (f.file, f.pos);
-                let n = (edx as usize).min(self.files[file].data.len() - pos);
-                self.open_file(ebx, false).pos += n;
+                let n = (edx as usize).min(self.files[file].data.len().saturating_sub(pos));
+                self.fd(ebx).pos += n;
                 let chunk = std::mem::take(&mut self.files[file].data);
                 self.write_bytes(ecx, &chunk[pos..pos + n]);
                 self.files[file].data = chunk;
@@ -628,7 +934,8 @@ impl Machine {
             // write(fd, buf, count)
             4 => {
                 let chunk = self.read_bytes(ecx, edx).to_vec();
-                let f = self.open_file(ebx, true);
+                let f = self.fd(ebx);
+                assert!(f.writable, "write to read-only file descriptor {ebx}");
                 let (file, pos) = (f.file, f.pos);
                 f.pos += chunk.len();
                 let data = &mut self.files[file].data;
@@ -640,34 +947,35 @@ impl Machine {
             }
             // open(path, flags, mode)
             5 => {
-                let path = self.c_string(ebx);
-                let writable = match ecx {
-                    0 => false,
-                    O_WRONLY_CREAT_TRUNC => true,
-                    _ => panic!("unsupported open flags {ecx:#o}"),
-                };
-                let existing = self.files.iter().position(|f| f.path == path);
-                let file = match (existing, writable) {
-                    (None, false) => return self.set_return(-ENOENT),
-                    (None, true) => {
-                        self.files.push(File {
-                            path,
-                            data: Vec::new(),
-                            created: true,
-                        });
-                        self.files.len() - 1
-                    }
-                    (Some(i), false) => i,
-                    (Some(i), true) => {
+                let path = canonical(&self.cwd, &self.c_string(ebx));
+                let file = match ecx {
+                    0 => self
+                        .find_file(&path)
+                        .unwrap_or_else(|| panic!("open of missing file {path}")),
+                    O_WRONLY_CREAT_TRUNC => {
+                        let i = self
+                            .files
+                            .iter()
+                            .position(|f| f.path == path)
+                            .unwrap_or_else(|| {
+                                self.files.push(File {
+                                    path,
+                                    data: Vec::new(),
+                                    created: true,
+                                    loaded: false,
+                                });
+                                self.files.len() - 1
+                            });
                         self.files[i].data.clear();
                         self.files[i].created = true;
                         i
                     }
+                    _ => panic!("unsupported open flags {ecx:#o}"),
                 };
                 let open = Some(OpenFile {
                     file,
                     pos: 0,
-                    writable,
+                    writable: ecx != 0,
                 });
                 let slot = match self.fds.iter().position(|f| f.is_none()) {
                     Some(i) => i,
@@ -679,11 +987,54 @@ impl Machine {
                 self.fds[slot] = open;
                 slot as i32 + 3
             }
-            // lseek(fd, offset, SEEK_SET)
+            // close(fd)
+            6 => {
+                self.fd(ebx);
+                self.fds[ebx as usize - 3] = None;
+                0
+            }
+            // chmod(path, mode): permissions are not modelled.
+            15 => {
+                let path = canonical(&self.cwd, &self.c_string(ebx));
+                self.find_file(&path)
+                    .unwrap_or_else(|| panic!("chmod of missing file {path}"));
+                0
+            }
+            // lseek(fd, offset, whence)
             19 => {
-                assert_eq!(edx, 0, "unsupported lseek whence {edx}");
-                self.open_file(ebx, false).pos = ecx as usize;
-                ecx as i32
+                let file = self.fd(ebx).file;
+                let base = match edx {
+                    0 => 0,
+                    1 => self.fd(ebx).pos as i64,
+                    2 => self.files[file].data.len() as i64,
+                    _ => panic!("unsupported lseek whence {edx}"),
+                };
+                let pos = base + ecx as i32 as i64;
+                assert!(
+                    (0..i32::MAX as i64).contains(&pos),
+                    "unsupported lseek offset"
+                );
+                self.fd(ebx).pos = pos as usize;
+                pos as i32
+            }
+            // brk(addr): returns the new break, or the old one on failure.
+            45 => {
+                let heap = &mut self.regions[self.heap];
+                if ebx >= heap.start && ebx <= HEAP_LIMIT {
+                    // Pages above the break are unmapped, so they read as
+                    // zero if the break grows again.
+                    let old_end = (heap.start as usize + heap.data.len()) / PAGE as usize;
+                    heap.data
+                        .resize((ebx.next_multiple_of(PAGE) - heap.start) as usize, 0);
+                    let new_end = (heap.start as usize + heap.data.len()) / PAGE as usize;
+                    if new_end < old_end {
+                        self.pages[new_end..old_end].fill(0);
+                    } else {
+                        self.pages[old_end..new_end].fill(self.heap as u8 + 1);
+                    }
+                    self.brk = ebx;
+                }
+                self.brk as i32
             }
             _ => panic!("unsupported system call {eax}"),
         };
