@@ -97,35 +97,50 @@ verbatim):
 ...
 ```
 
-`cargo run --release --bin stagex -- --prove` proves all 73 steps, through
-`M2-Planet` and the `M2-Mesoplanet` builds of mescc-tools-extra. See
-[PROGRESS.md](PROGRESS.md) for the status and cycle count of each step.
+Its [stage1 package](https://codeberg.org/stagex/stagex/src/branch/main/packages/bootstrap/stage1)
+copies stage0's binaries to `/usr/bin` and runs live-bootstrap's
+`pass1.kaem` scripts with stage0's `kaem`, one `RUN` per package. Each `RUN`
+is one step here: the guest emulates `kaem` itself and every process it starts.
+The steps, their environment and working directories come from the stage1
+`Containerfile`, vendored verbatim in `stagex/stage1/Containerfile`.
+
+`cargo run --release --bin stagex -- --prove` proves the 75 supported steps:
+all 73 of stage0, through `M2-Planet` and the `M2-Mesoplanet` builds of
+mescc-tools-extra, and stage1's `checksum-transcriber` and `simple-patch`.
+`--execute` runs them in the zkVM without proving and prints each step's
+cycle count; `--from N` runs the steps before `N` natively only, so that
+ranges of steps can be measured in parallel. See [PROGRESS.md](PROGRESS.md)
+for the status and cycle count of each step.
 
 Rather than reimplementing each tool, the guest (`program-x86`) runs the real
 binary in a small i386 Linux emulator (`lib/src/x86.rs`): an ELF loader, an
 [iced-x86](https://crates.io/crates/iced-x86) decoder with an executor for the
 instructions stage0 uses, and the system calls it makes (`open`, `close`,
-`read`, `write`, `lseek`, `brk`, `chmod`, `access`, `unlink`, `fork`,
-`execve`, `waitpid` and `exit`) over an in-memory filesystem. A forked child
+`read`, `write`, `lseek`, `brk`, `chmod`, `access`, `unlink`, `mkdir`,
+`symlink`, `chdir`, `getcwd`, `fork`, `execve`, `waitpid` and `exit`) over an
+in-memory filesystem with directories and symbolic links. A forked child
 runs to completion before its parent continues, which is a valid schedule
 because `M2-Mesoplanet` only waits for its children. Any instruction, system
 call or memory access outside that model panics, so no proof can be produced
 for it, and the tool must exit with status 0.
 
-Each proof commits the SHA256 of the tool binary, the argv and environment,
-the SHA256 of every file the step read and wrote, and every path it found to
-be a directory or missing. The steps link by hash: each step's tool and
+Each proof commits the SHA256 of the tool binary, the argv, working directory
+and environment, the SHA256 of every file the step read and wrote, every path
+it found to be a directory, symbolic link or missing, and the directories and
+links it created. The steps link by hash: each step's tool and
 inputs must be the seed, a pinned source file, or an earlier step's output.
 Missing paths must not exist in StageX's build, which the verifier checks
-against `stagex/sources.manifest`, the list of every path in the pinned
-source tarballs. The only trusted binary is the seed, whose hash is
+against `stagex/sources.manifest` and `stagex/stage1/manifest`, the lists of
+every path in each stage's pinned sources. The only trusted binary is the seed, whose hash is
 `f74dcf9cef2aee9eb7723eca755849d474fccd89662947021d1aa08429d23c13`.
 
-`stagex/sources` vendors the files the steps read from the source tarballs
-StageX pins by hash (stage0-posix-x86, M2libc, M2-Planet, M2-Mesoplanet,
-mescc-tools and mescc-tools-extra), at their absolute paths in StageX's build.
-`stagex/expected.sha256` lists every step's output hash, from running the same
-commands under `qemu-i386`. Use `--execute` to run the steps without proving.
+`stagex/sources` vendors the files the stage0 steps read from the source
+tarballs StageX pins by hash (stage0-posix-x86, M2libc, M2-Planet,
+M2-Mesoplanet, mescc-tools and mescc-tools-extra), at their absolute paths in
+StageX's build; `stagex/stage1/sources` does the same for stage1
+(live-bootstrap's `steps` and an older M2libc). `stagex/expected.sha256` lists
+every step's output hashes, from running the same commands outside the
+emulator (stage0 under `qemu-i386`, stage1 natively in a chroot).
 
 ## Quick start
 

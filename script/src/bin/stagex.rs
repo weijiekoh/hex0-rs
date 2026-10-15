@@ -1,4 +1,4 @@
-//! Runs StageX's x86 stage0 build in the zkVM, starting from the hex0 seed,
+//! Runs StageX's x86 bootstrap in the zkVM, starting from the hex0 seed,
 //! and checks that the steps link by hash.
 //!
 //! ```shell
@@ -69,12 +69,13 @@ fn main() {
     });
 
     let mut chain = Chain::new(Path::new("."));
-    for (i, argv) in chain.steps().into_iter().take(args.steps).enumerate() {
-        let step = i + 1;
+    for (i, step) in chain.steps().into_iter().take(args.steps).enumerate() {
+        let n = i + 1;
+        let command = step.argv.join(" ");
         // Run natively to find the step's inputs and its output files.
-        let prepared = chain.prepare(&argv);
-        if step < args.from {
-            chain.accept(&argv, &prepared.claim, prepared.created);
+        let prepared = chain.prepare(&step);
+        if n < args.from {
+            chain.accept(&step, &prepared.claim, prepared.created);
             continue;
         }
 
@@ -83,12 +84,12 @@ fn main() {
         let mut public_values = if let Some(light) = &light {
             let (public_values, report) = light.execute(STAGEX_X86_ELF, stdin).run().unwrap();
             // A guest panic is reported as an exit code.
-            assert_eq!(report.exit_code, 0, "step {step}: guest panicked");
+            assert_eq!(report.exit_code, 0, "step {n}: guest panicked");
             println!(
-                "step {step}: {} x86 instructions, {} cycles: {}",
+                "step {n}: {} x86 instructions, {} cycles: {command} (in {})",
                 prepared.instructions,
                 report.total_instruction_count(),
-                argv.join(" ")
+                step.cwd,
             );
             public_values
         } else {
@@ -101,13 +102,13 @@ fn main() {
                 .verify(&proof, pk.verifying_key(), None)
                 .expect("failed to verify proof");
             proof
-                .save(format!("{}/step-{step:02}.proof", args.out_dir))
+                .save(format!("{}/step-{n:02}.proof", args.out_dir))
                 .expect("failed to save proof");
-            println!("step {step}: proved and verified: {}", argv.join(" "));
+            println!("step {n}: proved and verified: {command} (in {})", step.cwd);
             std::mem::take(&mut proof.public_values)
         };
         let claim: StepClaim = public_values.read();
-        chain.accept(&argv, &claim, prepared.created);
+        chain.accept(&step, &claim, prepared.created);
     }
     if args.from == 1 {
         println!("All steps link from the seed {SEED_SHA256}.");

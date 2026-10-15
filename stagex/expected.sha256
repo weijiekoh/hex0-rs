@@ -71,3 +71,9 @@ db0f6fca1620434830bf17d04a3b5be45aec1289d370d1e818fb698db2188100  /build/mkdir
 5d8dcf521d3c19573fc919d9d3645132c88ed5ba67acede5be421f90b9b19d21  /build/rm
 bd9aeeaf7f78322358613ef113f18867b8571cddd886b81b46c966a9c87ab490  /build/replace
 cb84e2ca39c51eb1af385aa3125fd3f0b1b2d4bfb76dbd4ca2620f97c93eb7f2  /build/wrap
+59cc0fb361f84e81a1cda6111ef847188d6c7c839c5a52166d9185ca767cf920  /usr/bin/checksum-transcriber
+bf64cc601ec8ed8beb9567c1523b11a3cfef5941cd86f2ae3d13c0477eaa815e  /steps/checksum-transcriber-1.0/checksum-transcriber-1.0.x86.checksums
+bf64cc601ec8ed8beb9567c1523b11a3cfef5941cd86f2ae3d13c0477eaa815e  /steps/checksum-transcriber-1.0.x86.checksums
+e6826990991981a959646355b5418ce2561a2fd1724004dd5e0a845ebb387373  /usr/bin/simple-patch
+3f9f205f426fbce21f430d331eaecbf81aa51107310e5d192b65724a33c37b34  /steps/simple-patch-1.0/simple-patch-1.0.x86.checksums
+3f9f205f426fbce21f430d331eaecbf81aa51107310e5d192b65724a33c37b34  /steps/simple-patch-1.0.x86.checksums

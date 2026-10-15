@@ -24,11 +24,15 @@ const O_WRONLY_CREAT_TRUNC: u32 = 0o1101;
 const O_RDWR_CREAT_EXCL: u32 = 0o302;
 const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
+const ENOTDIR: i32 = 20;
+const ERANGE: i32 = 34;
 
 /// What exists at a path outside the files a program has created.
 pub enum Entry {
     File(Vec<u8>),
     Dir,
+    /// A symbolic link, with its target as written.
+    Link(String),
     Missing,
 }
 
@@ -41,6 +45,11 @@ pub struct Exit {
     pub lookups: Vec<(String, Entry)>,
     /// Files the programs created and did not delete, by canonical path.
     pub created: BTreeMap<String, Vec<u8>>,
+    /// Directories the programs created, by canonical path.
+    pub dirs: Vec<String>,
+    /// Symbolic links the programs created, by canonical path, with their
+    /// targets.
+    pub links: Vec<(String, String)>,
     /// Number of x86 instructions executed, across all processes.
     pub instructions: u64,
 }
@@ -331,6 +340,11 @@ struct Kernel<'a> {
     lookup: &'a mut dyn FnMut(&str) -> Entry,
     lookups: Vec<(String, Entry)>,
     files: Vec<File>,
+    /// Directories the programs created.
+    dirs: Vec<String>,
+    /// Symbolic links the programs created and did not delete, with their
+    /// targets.
+    links: Vec<(String, String)>,
     exited: BTreeMap<u32, u32>,
     next_pid: u32,
 }
@@ -384,6 +398,8 @@ pub fn run(
         lookup,
         lookups: Vec::new(),
         files: Vec::new(),
+        dirs: Vec::new(),
+        links: Vec::new(),
         exited: BTreeMap::new(),
         next_pid: 2,
     };
@@ -403,6 +419,8 @@ pub fn run(
         code,
         lookups: k.lookups,
         created,
+        dirs: k.dirs,
+        links: k.links,
         instructions,
     }
 }
@@ -1364,24 +1382,36 @@ impl Machine {
                 let file = match ecx {
                     0 => match k.find(&path) {
                         Some(Found::File(i)) => i,
-                        Some(Found::Dir) => panic!("open of directory {path}"),
+                        Some(_) => panic!("open of directory {path}"),
                         None => return self.set_return(-ENOENT),
                     },
                     // The result does not depend on whether the file
                     // existed, so this does not look it up.
                     O_WRONLY_CREAT_TRUNC => {
+                        // Writing through a link the programs created
+                        // writes its target.
+                        let mut path = k.follow_dirs(&path);
+                        while let Some((l, target)) = k.links.iter().find(|(l, _)| *l == path) {
+                            path = k.follow_dirs(&canonical(parent(l), target));
+                        }
                         match k.files.iter().position(|f| f.path == path && !f.deleted) {
                             Some(i) => {
                                 k.files[i].data.clear();
                                 k.files[i].created = true;
                                 i
                             }
-                            None => k.create(path),
+                            None => match k.create(path) {
+                                Ok(i) => i,
+                                Err(e) => return self.set_return(e),
+                            },
                         }
                     }
                     O_RDWR_CREAT_EXCL => match k.find(&path) {
                         Some(_) => return self.set_return(-EEXIST),
-                        None => k.create(path),
+                        None => match k.create(path) {
+                            Ok(i) => i,
+                            Err(e) => return self.set_return(e),
+                        },
                     },
                     _ => panic!("unsupported open flags {ecx:#o}"),
                 };
@@ -1413,11 +1443,17 @@ impl Machine {
             }
             // unlink(path): only files the programs created may be deleted.
             10 => {
-                let path = self.path_arg(ebx);
-                match k.find(&path) {
+                let path = k.follow_dirs(&self.path_arg(ebx));
+                match k.lfind(&path) {
                     Some(Found::File(i)) => {
                         assert!(k.files[i].created, "unlink of input file {path}");
                         k.files[i].deleted = true;
+                        0
+                    }
+                    Some(Found::Link(_)) => {
+                        let i = k.links.iter().position(|(l, _)| *l == path);
+                        k.links
+                            .remove(i.unwrap_or_else(|| panic!("unlink of input link {path}")));
                         0
                     }
                     Some(Found::Dir) => panic!("unlink of directory {path}"),
@@ -1430,7 +1466,7 @@ impl Machine {
                 let (argv, env) = (self.strings_arg(ecx), self.strings_arg(edx));
                 let elf = match k.find(&path) {
                     Some(Found::File(i)) => k.files[i].data.clone(),
-                    Some(Found::Dir) => panic!("execve of directory {path}"),
+                    Some(_) => panic!("execve of directory {path}"),
                     None => return self.set_return(-ENOENT),
                 };
                 let mut image = Machine::load(&elf, &argv, &env, &self.cwd);
@@ -1461,6 +1497,69 @@ impl Machine {
                 );
                 self.fd(ebx).pos = pos as usize;
                 pos as i32
+            }
+            // chdir(path)
+            12 => {
+                let path = self.path_arg(ebx);
+                match k.find(&path) {
+                    Some(Found::Dir) => {
+                        self.cwd = path;
+                        0
+                    }
+                    Some(_) => -ENOTDIR,
+                    None => -ENOENT,
+                }
+            }
+            // getcwd(buf, size): returns the length including the NUL.
+            183 => {
+                let mut path = self.cwd.clone().into_bytes();
+                path.push(0);
+                if path.len() > ecx as usize {
+                    -ERANGE
+                } else {
+                    self.write_bytes(ebx, &path);
+                    path.len() as i32
+                }
+            }
+            // mkdir(path, mode): permissions are not modelled.
+            39 => {
+                let path = k.follow_dirs(&self.path_arg(ebx));
+                if path == "/" || k.lfind(&path).is_some() {
+                    -EEXIST
+                } else {
+                    match k.find(parent(&path)) {
+                        Some(Found::Dir) => {
+                            k.dirs.push(path);
+                            0
+                        }
+                        Some(_) => -ENOTDIR,
+                        None => -ENOENT,
+                    }
+                }
+            }
+            // symlink(target, path)
+            83 => {
+                let target = self.c_string(ebx);
+                let path = k.follow_dirs(&self.path_arg(ecx));
+                if path == "/" || k.lfind(&path).is_some() {
+                    -EEXIST
+                } else {
+                    match k.find(parent(&path)) {
+                        Some(Found::Dir) => {
+                            k.links.push((path, target));
+                            0
+                        }
+                        Some(_) => -ENOTDIR,
+                        None => -ENOENT,
+                    }
+                }
+            }
+            // clock_gettime(clock, ts): the clock always reads zero, so that
+            // runs are deterministic.
+            265 => {
+                assert!(ebx <= 2, "unsupported clock {ebx}");
+                self.write_bytes(ecx, &[0; 8]);
+                0
             }
             // access(path, mode): permissions are not modelled.
             33 => {
@@ -1501,19 +1600,71 @@ impl Machine {
 enum Found {
     File(usize),
     Dir,
+    Link(String),
+}
+
+/// The directory part of a canonical path.
+fn parent(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
 }
 
 impl Kernel<'_> {
-    /// Finds what exists at a canonical path, asking `lookup` about paths
-    /// the programs have not created.
+    /// Finds what exists at a canonical path, following symbolic links.
     fn find(&mut self, path: &str) -> Option<Found> {
+        let mut path = self.follow_dirs(path);
+        // Linux gives up after 40 links.
+        for _ in 0..40 {
+            match self.lfind(&path) {
+                Some(Found::Link(target)) => {
+                    path = self.follow_dirs(&canonical(parent(&path), &target));
+                }
+                found => return found,
+            }
+        }
+        panic!("too many levels of symbolic links at {path}")
+    }
+
+    /// Resolves the symbolic links the programs created among the
+    /// directories of a canonical path, but not its last component.
+    fn follow_dirs(&self, path: &str) -> String {
+        let mut path = path.to_string();
+        for _ in 0..40 {
+            let link = self.links.iter().find(|(link, _)| {
+                path.len() > link.len()
+                    && path.starts_with(link.as_str())
+                    && path.as_bytes()[link.len()] == b'/'
+            });
+            match link {
+                Some((link, target)) => {
+                    path = canonical(parent(link), &format!("{target}{}", &path[link.len()..]));
+                }
+                None => return path,
+            }
+        }
+        panic!("too many levels of symbolic links at {path}")
+    }
+
+    /// Finds what exists at a canonical path without following a symbolic
+    /// link at its last component, asking `lookup` about paths the programs
+    /// have not created.
+    fn lfind(&mut self, path: &str) -> Option<Found> {
         if let Some(i) = self.files.iter().position(|f| f.path == path && !f.deleted) {
             return Some(Found::File(i));
+        }
+        if self.dirs.iter().any(|d| d == path) {
+            return Some(Found::Dir);
+        }
+        if let Some((_, target)) = self.links.iter().find(|(l, _)| l == path) {
+            return Some(Found::Link(target.clone()));
         }
         if let Some((_, entry)) = self.lookups.iter().find(|(p, _)| p == path) {
             // A file that was looked up but is not in `files` was deleted.
             return match entry {
                 Entry::Dir => Some(Found::Dir),
+                Entry::Link(target) => Some(Found::Link(target.clone())),
                 _ => None,
             };
         }
@@ -1529,19 +1680,26 @@ impl Kernel<'_> {
                 Some(Found::File(self.files.len() - 1))
             }
             Entry::Dir => Some(Found::Dir),
+            Entry::Link(target) => Some(Found::Link(target.clone())),
             Entry::Missing => None,
         };
         self.lookups.push((path.to_string(), entry));
         found
     }
 
-    fn create(&mut self, path: String) -> usize {
+    /// Creates an empty file in an existing directory.
+    fn create(&mut self, path: String) -> Result<usize, i32> {
+        match self.find(parent(&path)) {
+            Some(Found::Dir) => {}
+            Some(_) => return Err(-ENOTDIR),
+            None => return Err(-ENOENT),
+        }
         self.files.push(File {
             path,
             data: Vec::new(),
             created: true,
             deleted: false,
         });
-        self.files.len() - 1
+        Ok(self.files.len() - 1)
     }
 }
