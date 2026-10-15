@@ -111,24 +111,23 @@ from running the same commands under `qemu-i386`.
 
 | Step           | Output SHA256  | SP1 cycles |
 |----------------|----------------|------------|
-| `hex0`         | `f74dcf9c...`  | 34M        |
-| `kaem-minimal` | `545f8953...`  | 97M        |
-| `hex1`         | `30da8f01...`  | 59M        |
-| `hex2-0`       | `8aaab3e7...`  | 272M       |
+| `hex0`         | `f74dcf9c...`  | 33M        |
+| `kaem-minimal` | `545f8953...`  | 92M        |
+| `hex1`         | `30da8f01...`  | 57M        |
+| `hex2-0`       | `8aaab3e7...`  | 243M       |
 
 `hex0` built from source is byte-identical to the seed. Use `--execute` to
 run the steps without proving.
 
 ## Quick start
 
-First, install [SP1](https://docs.succinct.xyz/). This project has been tested with: 
+First, install [SP1](https://docs.succinct.xyz/). This project has been tested with
+SP1 6.9.0 (`sp1up -v v6.9.0`) and `protoc`
+(`apt-get install protobuf-compiler`):
 
 ```
-$ cargo +succinct --version
-cargo 1.91.0-nightly (840b83a10 2025-07-30)
-
 $ cargo prove --version
-cargo-prove sp1 (3209d54 2025-08-05T20:15:44.228807077Z)
+cargo-prove sp1 (b8387fa 2026-10-10T01:11:43.465050360Z)
 ```
 
 Next, run:

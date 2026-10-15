@@ -10,10 +10,13 @@ use clap::Parser;
 use hex0_lib::stagex::{
     run_step, sha256, StepClaim, StepInputs, SEED_PATH, SEED_SHA256, SOURCES_DIR, STEPS,
 };
-use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use sp1_sdk::{
+    blocking::{ProveRequest, Prover, ProverClient},
+    include_elf, Elf, ProvingKey, SP1Stdin,
+};
 use std::collections::BTreeMap;
 
-pub const STAGEX_X86_ELF: &[u8] = include_elf!("stagex-x86-program");
+pub const STAGEX_X86_ELF: Elf = include_elf!("stagex-x86-program");
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -38,8 +41,15 @@ fn main() {
     }
     std::fs::create_dir_all(&args.out_dir).expect("failed to create output directory");
 
-    let client = ProverClient::from_env();
-    let keys = args.prove.then(|| client.setup(STAGEX_X86_ELF));
+    // The light prover executes without initializing the full prover.
+    let light = args
+        .execute
+        .then(|| ProverClient::builder().light().build());
+    let prover = args.prove.then(|| {
+        let client = ProverClient::from_env();
+        let pk = client.setup(STAGEX_X86_ELF).expect("failed to setup elf");
+        (client, pk)
+    });
 
     let seed = std::fs::read(SEED_PATH).expect("failed to read the seed");
     assert_eq!(
@@ -69,19 +79,28 @@ fn main() {
         let mut stdin = SP1Stdin::new();
         stdin.write(&inputs);
         let mut public_values = if args.execute {
-            let (public_values, report) = client.execute(STAGEX_X86_ELF, &stdin).run().unwrap();
+            let (public_values, report) = light
+                .as_ref()
+                .unwrap()
+                .execute(STAGEX_X86_ELF, stdin)
+                .run()
+                .unwrap();
+            // A guest panic is reported as an exit code.
+            assert_eq!(report.exit_code, 0, "{output}: guest panicked");
             println!(
                 "{output}: executed in {} cycles",
                 report.total_instruction_count()
             );
             public_values
         } else {
-            let (pk, vk) = keys.as_ref().unwrap();
+            let (client, pk) = prover.as_ref().unwrap();
             let mut proof = client
-                .prove(pk, &stdin)
+                .prove(pk, stdin)
                 .run()
                 .expect("failed to generate proof");
-            client.verify(&proof, vk).expect("failed to verify proof");
+            client
+                .verify(&proof, pk.verifying_key(), None)
+                .expect("failed to verify proof");
             proof
                 .save(format!("{}/{output}.proof", args.out_dir))
                 .expect("failed to save proof");

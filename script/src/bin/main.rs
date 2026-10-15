@@ -10,11 +10,14 @@
 use clap::Parser;
 use hex0_lib::hex0;
 use sha2::{Digest, Sha256};
-use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use sp1_sdk::{
+    blocking::{ProveRequest, Prover, ProverClient},
+    include_elf, Elf, ProvingKey, SP1Stdin,
+};
 use std::os::unix::fs::PermissionsExt;
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
-pub const HEX0_ELF: &[u8] = include_elf!("hex0-program");
+pub const HEX0_ELF: Elf = include_elf!("hex0-program");
 
 /// The arguments for the command.
 #[derive(Parser, Debug)]
@@ -55,9 +58,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Setup the prover client.
-    let client = ProverClient::from_env();
-
     // Open the file and read it as bytes
     let input_bytes = std::fs::read(&args.input_hex0_file).expect("failed to read input file");
 
@@ -76,7 +76,11 @@ fn main() {
 
     if args.execute {
         // Execute the program
-        let (output, report) = client.execute(HEX0_ELF, &stdin).run().unwrap();
+        // The light prover executes without initializing the full prover.
+        let client = ProverClient::builder().light().build();
+        let (output, report) = client.execute(HEX0_ELF, stdin).run().unwrap();
+        // A guest panic, such as a hash mismatch, is reported as an exit code.
+        assert_eq!(report.exit_code, 0, "Program panicked");
         println!("Program executed successfully.");
 
         // Record the number of cycles executed.
@@ -85,18 +89,21 @@ fn main() {
         println!("output: {:?}", output);
     } else {
         // Setup the program for proving.
-        let (pk, vk) = client.setup(HEX0_ELF);
+        let client = ProverClient::from_env();
+        let pk = client.setup(HEX0_ELF).expect("failed to setup elf");
 
         // Generate the proof
         let proof = client
-            .prove(&pk, &stdin)
+            .prove(&pk, stdin)
             .run()
             .expect("failed to generate proof");
 
         println!("Successfully generated proof!");
 
         // Verify the proof.
-        client.verify(&proof, &vk).expect("failed to verify proof");
+        client
+            .verify(&proof, pk.verifying_key(), None)
+            .expect("failed to verify proof");
         println!("Successfully verified proof!");
 
         // Write the proof to a file.

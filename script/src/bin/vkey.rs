@@ -1,10 +1,13 @@
-use sp1_sdk::{include_elf, HashableKey, Prover, ProverClient};
+use sp1_sdk::{
+    blocking::{Prover, ProverClient},
+    include_elf, Elf, HashableKey, ProvingKey,
+};
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
-pub const HEX0_ELF: &[u8] = include_elf!("hex0-program");
+pub const HEX0_ELF: Elf = include_elf!("hex0-program");
 
 fn main() {
     let prover = ProverClient::builder().cpu().build();
-    let (_, vk) = prover.setup(HEX0_ELF);
-    println!("{}", vk.bytes32());
+    let pk = prover.setup(HEX0_ELF).expect("failed to setup elf");
+    println!("{}", pk.verifying_key().bytes32());
 }

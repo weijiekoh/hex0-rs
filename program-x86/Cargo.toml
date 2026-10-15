@@ -4,5 +4,5 @@ name = "stagex-x86-program"
 edition = "2021"
 
 [dependencies]
-sp1-zkvm = "5.0.8"
+sp1-zkvm = "6.9.0"
 hex0-lib = { path = "../lib" }
