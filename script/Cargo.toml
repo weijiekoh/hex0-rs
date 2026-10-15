@@ -13,6 +13,10 @@ path = "src/bin/main.rs"
 #path = "src/bin/evm.rs"
 
 [[bin]]
+name = "stagex"
+path = "src/bin/stagex.rs"
+
+[[bin]]
 name = "vkey"
 path = "src/bin/vkey.rs"
 

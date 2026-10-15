@@ -77,6 +77,48 @@ author is open to exploring more efficient proof systems as they are developed.
 Additionally, the SP1 prover and verifier must be boostrapped so that its
 outputs can be trusted. A long-term goal of this project is to do so.
 
+## StageX x86 bootstrap
+
+StageX bootstraps on `linux/386`. Its
+[stage0 package](https://codeberg.org/stagex/stagex/src/branch/main/packages/bootstrap/stage0)
+starts from a 181-byte `hex0-seed` and runs:
+
+```
+/hex0-seed /x86/hex0_x86.hex0     hex0
+./hex0     /x86/kaem-minimal.hex0 kaem-minimal
+./hex0     /x86/hex1_x86.hex0     hex1
+./hex1     /x86/hex2_x86.hex1     hex2-0
+...
+```
+
+`cargo run --release --bin stagex -- --prove` proves these four steps. Rather
+than reimplementing each tool, the guest (`program-x86`) runs the real binary
+in a small i386 Linux emulator (`lib/src/x86.rs`): an ELF loader, an
+[iced-x86](https://crates.io/crates/iced-x86) decoder with an executor for the
+instructions stage0 uses, and the `open`, `read`, `write`, `lseek` and `exit`
+system calls over an in-memory filesystem. Any instruction, system call or
+memory access outside that model panics, so no proof can be produced for it,
+and the tool must exit with status 0.
+
+Each proof commits the SHA256 of the tool binary, the argv, and the SHA256 of
+every input and output file. The steps link by hash: each step's tool must be
+the seed or an earlier step's output. The only trusted binary is the seed,
+whose hash is `f74dcf9cef2aee9eb7723eca755849d474fccd89662947021d1aa08429d23c13`.
+`stagex/` vendors the seed and the sources from the
+[stage0-posix-x86 commit](https://github.com/oriansj/stage0-posix-x86/tree/a15adc72f099506fb0d40c8824d7aaa97735f7c3)
+that StageX pins. The expected output hashes in `lib/src/stagex.rs` come
+from running the same commands under `qemu-i386`.
+
+| Step           | Output SHA256  | SP1 cycles |
+|----------------|----------------|------------|
+| `hex0`         | `f74dcf9c...`  | 34M        |
+| `kaem-minimal` | `545f8953...`  | 97M        |
+| `hex1`         | `30da8f01...`  | 59M        |
+| `hex2-0`       | `8aaab3e7...`  | 272M       |
+
+`hex0` built from source is byte-identical to the seed. Use `--execute` to
+run the steps without proving.
+
 ## Quick start
 
 First, install [SP1](https://docs.succinct.xyz/). This project has been tested with: 

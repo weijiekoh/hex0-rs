@@ -2,6 +2,7 @@
 members = [
     "lib",
     "program",
+    "program-x86",
     "script",
 ]
 resolver = "2"

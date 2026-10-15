@@ -9,3 +9,4 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.200", default-features = false, features = ["derive"] }
 sha2 = "0.10.9"
 hex = "0.4.3"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }

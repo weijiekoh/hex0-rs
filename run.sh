@@ -26,3 +26,5 @@ cargo run --release -- --prove \
     --input-hex0-file ./hex0_src/hex1_x86.hex0 \
     --expected-hash 30da8f019c21e71d9ea60b374272209956256958d21f698c0b757c8fa560c9cf \
     --output-hex1 hex1/hex1_x86.hex1
+
+cargo run --release --bin stagex -- --prove --out-dir proofs/stagex

@@ -1,3 +1,6 @@
+pub mod stagex;
+pub mod x86;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PublicInputs {
     pub source_bytes: Vec<u8>,

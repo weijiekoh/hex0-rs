@@ -1,0 +1,8 @@
+[package]
+version = "0.1.0"
+name = "stagex-x86-program"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = "5.0.8"
+hex0-lib = { path = "../lib" }
