@@ -11,7 +11,7 @@ hash (see the README).
 | Stage | StageX package | Steps | Status |
 |---|---|---|---|
 | 0 | `bootstrap-stage0` | 1–73 | All 73 steps run in the emulator and reproduce StageX's output hashes. |
-| 1 | `bootstrap-stage1`, kaem phase | 74–75 of 14 `RUN`s | `checksum-transcriber` and `simple-patch` reproduce live-bootstrap's published x86 checksums. `mes-0.27` is next; see below. |
+| 1 | `bootstrap-stage1`, kaem phase | Steps 74–75: first 2 of 14 `RUN`s | `checksum-transcriber` and `simple-patch` reproduce live-bootstrap's published x86 checksums. `mes-0.27` is next; see below. |
 | 1 | `bootstrap-stage1`, bash phase | – | Not started (tcc, musl, gcc and the rest of live-bootstrap). |
 | 2, 3 | `bootstrap-stage2`, `bootstrap-stage3` | – | Not started. |
 
@@ -54,17 +54,17 @@ Pending steps can be estimated from their x86 instruction counts on that basis.
 | 19 | `M0` | `blood-elf-0.hex2` | 34,179,100 | 1,817,368,981 | 1.82B |
 | 20 | `catm` | `blood-elf-0-0.hex2` | 78 | 16,234,140 | 16.23M |
 | 21 | `hex2-0` | `blood-elf-0` | 10,296,422 | 679,499,197 | 679.50M |
-| 22 | `M2` | `M1-macro-0.M1` | 1,223,195,661 | pending | ≈68.51B |
-| 23 | `blood-elf-0` | `M1-macro-0-footer.M1` | 132,874,960 | pending | ≈7.46B |
-| 24 | `catm` | `M1-macro-0-0.M1` | 130 | pending | ≈15.01M |
-| 25 | `M0` | `M1-macro-0.hex2` | 62,749,641 | pending | ≈3.53B |
-| 26 | `catm` | `M1-macro-0-0.hex2` | 78 | pending | ≈15.00M |
-| 27 | `hex2-0` | `M1-0` | 76,702,142 | pending | ≈4.31B |
-| 28 | `M2` | `hex2_linker-0.M1` | 2,282,630,400 | pending | ≈127.84B |
-| 29 | `blood-elf-0` | `hex2_linker-0-footer.M1` | 218,847,343 | pending | ≈12.27B |
-| 30 | `M1-0` | `hex2_linker-0.hex2` | 283,338,732 | pending | ≈15.88B |
-| 31 | `catm` | `hex2_linker-0-0.hex2` | 78 | pending | ≈15.00M |
-| 32 | `hex2-0` | `hex2-1` | 195,068,850 | pending | ≈10.94B |
+| 22 | `M2` | `M1-macro-0.M1` | 1,223,195,661 | 67,630,294,007 | 67.63B |
+| 23 | `blood-elf-0` | `M1-macro-0-footer.M1` | 132,874,960 | 7,078,939,935 | 7.08B |
+| 24 | `catm` | `M1-macro-0-0.M1` | 130 | 32,378,929 | 32.38M |
+| 25 | `M0` | `M1-macro-0.hex2` | 62,749,641 | 3,373,308,062 | 3.37B |
+| 26 | `catm` | `M1-macro-0-0.hex2` | 78 | 21,728,164 | 21.73M |
+| 27 | `hex2-0` | `M1-0` | 76,702,142 | 4,442,650,102 | 4.44B |
+| 28 | `M2` | `hex2_linker-0.M1` | 2,282,630,400 | 126,115,163,296 | 126.12B |
+| 29 | `blood-elf-0` | `hex2_linker-0-footer.M1` | 218,847,343 | 11,645,341,137 | 11.65B |
+| 30 | `M1-0` | `hex2_linker-0.hex2` | 283,338,732 | 15,972,374,888 | 15.97B |
+| 31 | `catm` | `hex2_linker-0-0.hex2` | 78 | 28,239,794 | 28.24M |
+| 32 | `hex2-0` | `hex2-1` | 195,068,850 | 11,105,957,170 | 11.11B |
 | 33 | `M2` | `M1-macro-1.M1` | 2,347,720,731 | pending | ≈131.49B |
 | 34 | `blood-elf-0` | `M1-macro-1-footer.M1` | 216,142,676 | pending | ≈12.12B |
 | 35 | `M1-0` | `M1-macro-1.hex2` | 282,050,671 | pending | ≈15.81B |
@@ -98,7 +98,7 @@ Pending steps can be estimated from their x86 instruction counts on that basis.
 | 63 | `M2-Mesoplanet` | `mkdir` | 2,430,912,713 | pending | ≈136.15B |
 | 64 | `M2-Mesoplanet` | `untar` | 2,931,922,087 | pending | ≈164.20B |
 | 65 | `M2-Mesoplanet` | `ungz` | 3,896,891,828 | pending | ≈218.24B |
-| 66 | `M2-Mesoplanet` | `unbz2` | 3,899,043,400 | pending | ≈218.36B |
+| 66 | `M2-Mesoplanet` | `unbz2` | 3,899,043,400 | 215,337,593,384 | 215.34B |
 | 67 | `M2-Mesoplanet` | `unxz` | 6,871,392,382 | pending | ≈384.81B |
 | 68 | `M2-Mesoplanet` | `catm` | 1,675,162,579 | pending | ≈93.82B |
 | 69 | `M2-Mesoplanet` | `cp` | 2,753,254,164 | pending | ≈154.20B |
@@ -106,17 +106,106 @@ Pending steps can be estimated from their x86 instruction counts on that basis.
 | 71 | `M2-Mesoplanet` | `rm` | 2,322,351,056 | pending | ≈130.07B |
 | 72 | `M2-Mesoplanet` | `replace` | 2,561,935,809 | pending | ≈143.48B |
 | 73 | `M2-Mesoplanet` | `wrap` | 2,675,895,849 | pending | ≈149.87B |
-| 74 | `kaem checksum-transcriber-1.0/pass1.kaem` | `/usr/bin/checksum-transcriber` | 2,590,889,074 | pending | ≈145.10B |
+| 74 | `kaem checksum-transcriber-1.0/pass1.kaem` | `/usr/bin/checksum-transcriber` | 2,590,889,074 | 143,565,283,070 | 143.57B |
 | 75 | `kaem simple-patch-1.0/pass1.kaem` | `/usr/bin/simple-patch` | 2,610,092,094 | pending | ≈146.18B |
 
-**Total:** 85,488,477,273 x86 instructions (85.49B) over 75 steps; 22 steps measured at 119.36B SP1 cycles; all 75 steps ≈4.79T SP1 cycles including estimates.
+**Total:** 85,488,477,273 x86 instructions (85.49B) over 75 steps; 35 steps measured at 725.71B SP1 cycles in the range runs; all 75 steps ≈4.8T SP1 cycles including estimates.
 
-
-Steps 1–73 were measured with the guest at commit `4e7558c`. Steps 74–75 need
-the stage1 support added in `85d598c`, whose guest also commits each step's
+The recorded range measurements of stage0 use the guest at commit
+[`4e7558c`](https://github.com/weijiekoh/hex0-rs/commit/4e7558c).
+Steps 74–75 need the stage1 support added in
+[`85d598c`](https://github.com/weijiekoh/hex0-rs/commit/85d598c), whose guest also commits each step's
 working directory, links and created directories, and checks that a new
 file's directory exists. That guest is up to 3% slower on steps 1–7 (for
 example, step 4 takes 90.2M cycles instead of 88.1M).
+
+## Isolated orb baseline (2026-10-16)
+
+This is an **execution and guest-cycle profiling baseline**, not a proving
+throughput measurement or a benchmark of a ThinkPad. The four background
+cycle-measurement jobs and the Mes job were frozen during measurement to
+avoid CPU contention, and all five jobs were resumed afterward. The orb
+exposes four logical CPUs (two cores, SMT) of
+an Intel Xeon at 2.60 GHz, 7.8 GiB physical RAM and a **6 GiB workload cgroup
+limit**, with no swap. `RAYON_NUM_THREADS=4` was fixed.
+
+The guest was rebuilt from the current working tree, including the pending
+Mes `sal`/`ioctl` support, without any new emulator optimization. This is a
+different guest from the earlier range runs above; do not compare their
+cycle counts as an optimization result. Source snapshots and the exact ELF
+are saved with the benchmark harness.
+
+| Step | Work | Trials | SP1 cycles per trial | Normalized gas | Median execute time | Execute time range |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | seed → hex0 | 3 | 18,905,462 | 32,320,104 | 0.357 s | 0.338–0.380 s |
+| 6 | catm → M0.hex2 | 3 | 15,421,039 | 48,074,548 | 0.329 s | 0.323–0.367 s |
+| 8 | M0 → cc_x86-0.hex2 | 3 | 2,085,215,511 | 1,946,817,228 | 21.095 s | 20.732–21.438 s |
+| 17 | M2 → blood-elf-0.M1 | 1 | 49,322,020,830 | 44,882,925,680 | 496.541 s | — (one run) |
+
+Every trial exited successfully and its complete public claim matched the
+native run, whose outputs were checked against the pinned chain hashes.
+Timing includes the SDK execution call and gas calculation, but excludes
+compilation, native input discovery and client initialization. The cycles
+and gas were identical across repetitions. Execution uses SP1 6.9.0's light
+prover and native executor. `GAS_TRACE_CHUNK_THRESHOLD=4194304` and
+`GAS_TRACE_CHUNK_SLOTS=2` were fixed: chunk size does not affect instruction
+cycles, but **does affect gas** through memory-boundary accounting. Gas must
+not be compared with default-chunk measurements as if the settings matched.
+
+### Guest profiles and optimization priorities
+
+The same ELF was profiled once per step with the SDK's `profiling` feature
+and `TRACE_SAMPLE_RATE=1000`. Profiling uses the portable executor, so its
+wall times are not execution baselines. These are sampled **guest-cycle**
+shares, not host CPU or prover profiles; inclusive percentages overlap.
+
+| Step | Samples | Main observations |
+|---:|---:|---|
+| 1 | 18,906 | `run_process` self 37.06%; `memset` self 25.41%; decoder table initialization inclusive 21.64%. |
+| 6 | 15,422 | `memset` self 34.06%, `memcpy` self 21.74%; decoder table initialization inclusive 26.55%. |
+| 8 | 2,085,216 | `run_process` self 93.83%; syscalls inclusive 4.02%; `read_slow` self 1.37%; `decode_new` inclusive 0.23%. |
+
+For reducing the total cost of the large bootstrap steps, prioritize
+experiments on the hot interpreter loop and its inlined instruction/memory
+handlers. **The 93.83% is not a measurement of dispatch alone**: the compiler
+inlines substantial handler work into that function. A finer attribution or
+controlled A/B implementation is needed before predicting a speedup.
+The earlier direct-op-linking experiment regressed step 8 and is not grounds
+for assuming that a new dispatch layout will help.
+
+Reducing allocation/zeroing/copying and decoder startup is the clearer,
+lower-risk target for the small steps, but decoder startup alone cannot
+materially improve step 8 (all of `decode_new` is only 0.23%). Changes must
+retain exact x86 execution and file/hash checks; no host-supplied outputs or
+unverified predecoded instruction streams should replace those checks.
+
+### CPU core-proof attempt
+
+A real, explicit CPU prover (not mock or network proving) was attempted for
+step 1. Its service had a **3 GiB memory cap** to leave room within the 6 GiB
+workload limit for Amp and the frozen jobs. Smaller trace chunks/shards and
+single core/setup/splicing workers were configured; exact settings are in
+the reproduction instructions. It was killed for exceeding memory during
+`initializing cpu prover`, before setup returned or proof generation began.
+The service automatically retried twice before it was stopped; the journal
+records the OOM failures. **No proof, verification result, or proving-time
+baseline was obtained.** This establishes failure under the allocated cap,
+not that the workload cannot be proved with more memory or another setup.
+
+### Reproduction and evidence
+
+Artifacts are under `.amp/in/artifacts/baseline/`: `execution.jsonl` and
+`execution-large.jsonl`, `execution-summary.csv`, `profile-execution.jsonl`,
+`profile-functions.csv`, `profiles.tar.gz` (Gecko profiles), execution logs,
+and `proof-attempt-journal.txt`. `reproduce.tar.gz` contains the harness,
+lockfile, library snapshot, guest ELF and reproduction instructions (also
+saved separately as `REPRODUCE.md`). Run it from the repository root so the
+pinned StageX inputs are found. None of these measurements uses new emulator
+optimizations.
+
+- Guest ELF SHA-256: `d3a0b65fd3b41e640bbd9a53aa315b8a42744fc24b187ac4a177e7cb9599bbb1`.
+- `lib/src/x86.rs` SHA-256: `dbd33701c3afe922acabcd227091ca2174c88c3f2fae0c46f50c43f4cf582713`.
+- `lib/src/stagex.rs` SHA-256: `51a5a649201f3ee3b7f83cfce7858f5d1805171cc2278d44b3d1a1503fcde6ba`.
 
 ## Next: `mes-0.27` (stage1 step 76)
 
@@ -133,14 +222,15 @@ Mes's C library. Options for making it practical to prove:
 
 - Split the step at process boundaries: prove each `mescc` invocation as its
   own step, and prove `kaem`'s interpretation of the script separately.
-- Lower the per-instruction cost further (dispatch accounts for about half of
-  it), or translate hot x86 blocks to RISC-V ahead of time.
+- Lower the per-instruction cost further, or translate hot x86 blocks to
+  RISC-V ahead of time. The current profile puts most large-step cycles in
+  the interpreter loop, but does not isolate dispatch from inlined handlers.
 
 ## Caveats
 
-- No proofs were generated in this orb: it runs SP1's executor only. Use
-  `--prove` on a machine with enough memory for the prover, or the prover
-  network.
+- No proofs have been successfully generated in this orb. The bounded CPU
+  attempt above failed during prover initialization. Use `--prove` on a
+  machine with enough memory for the prover, or the prover network.
 - Execute mode sets `GAS_TRACE_CHUNK_THRESHOLD=4194304` unless it is already
   set, because SP1's default needs a 4.7 GB `/dev/shm`. It does not change
   cycle counts.
