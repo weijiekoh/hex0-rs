@@ -289,6 +289,68 @@ optimization-only patch.
 - Optimized guest ELF SHA-256: `58fe0a31a31a818bb28495ac86cd2bcd232a006b8ba4222f2a5e99fa4fd64e84`.
 - Optimized `lib/src/x86.rs` SHA-256: `ac2992b11a3e3cb69378cf7d0af6032bd296e5f9acace55deabc0357a87d3a31`.
 
+## Interpreter optimizations — batch 2
+
+Native instruction profiles identified common repeated sequences. The
+guest now caches a few of these sequences as one decoded operation, while
+executing every original x86 instruction's effects and counting each one.
+Fusion is restricted to bytes from the instruction fetch and to spans wholly
+inside the cached ELF image. Code that continues onto stack or heap pages
+uses the original instruction path.
+
+Retained changes:
+
+- CMP/TEST followed by JE/JNE, with the comparison's complete flags.
+- POP followed by POP or RET, and immediate/base-load MOV followed by POP.
+  ESP and destination aliases retain sequential x86 semantics.
+- CMP register, SETcc byte register and MOVZX from that byte into its full
+  register. This is fused only when the MOVZX overwrites the SETcc byte.
+- Simple base-plus-displacement LEA, pre-scaled register offsets and a
+  64-byte decoded-instruction stride. The larger arena avoids slower RV64
+  index arithmetic.
+
+| Step | Batch 1 cycles | Batch 2 cycles | Reduction | Batch 1 normalized gas | Batch 2 normalized gas | Reduction | Total cycle reduction from baseline |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 11,949,887 | 11,272,875 | 5.67% | 15,594,878 | 14,916,969 | 4.35% | 40.37% |
+| 6 | 6,693,109 | 6,695,122 | -0.03% | 15,850,927 | 15,851,586 | -0.00% | 56.58% |
+| 8 | 1,882,412,249 | 1,668,036,134 | 11.39% | 1,696,105,667 | 1,473,421,574 | 13.13% | 20.01% |
+| 17 | 46,123,377,109 | 39,126,680,122 | **15.17%** | 40,975,823,513 | 33,818,575,984 | **17.47%** | **20.67%** |
+
+Step 6 is a 78-instruction `catm` control and is essentially flat. All
+public claims and emulated x86 instruction counts are unchanged.
+Steps 1, 6 and 8 were repeated three times with identical cycles and gas.
+Their isolated median execution times were 0.277975 s, 0.209899 s and
+17.184692 s: respectively 17.09%, 1.50% and 15.48% below batch 1. These are
+three-sample medians on this orb, not proving times. Step 17 was measured
+once while native validation ran, so its wall time is not compared.
+
+Validation:
+
+- `cargo test --release -p hex0-lib`: 6 passed, 1 ignored.
+- `cargo test --release -p hex0-lib stagex_chain_full -- --ignored --nocapture`:
+  passed in 317.18 s after the final boundary guard.
+- Generated i386 checks cover 6,272 CMP/SETcc/MOVZX cases and 280
+  comparison/branch cases. Expected values come from integer relations,
+  not emulator helpers. They cover all modeled conditions, high/low byte
+  registers, overflow, taken/untaken branches and 15-byte fetch boundaries.
+  The checks pass on actual Linux i386, the pre-batch emulator, and the
+  final native emulator and SP1 guest.
+- Additional fixtures cover cross-page branch modification, entering the
+  second instruction directly, nonmatching boolean conversions, LEA
+  wrapping, POP ESP and MOV/POP aliases. A scratch mutant that marks only
+  the first instruction's page as code fails the retained regression test.
+- An image-to-stack boundary fixture found a candidate-only panic. The
+  boundary guard fixed it; the original emulator, final native emulator and
+  SP1 guest pass it, and a regression test now covers it.
+
+No new proof was attempted; the earlier prover-initialization memory limit
+is unchanged. Cycle and gas reductions are cost proxies, not measured
+proving-time reductions. Evidence and reproduction instructions are in
+`.amp/in/artifacts/optimization-2/`.
+
+- Final guest ELF SHA-256: `7d5b57c6742cf908e2047d80735345915646930b55b4abc1f1b4c475fc47a662`.
+- Final measured `lib/src/x86.rs` SHA-256: `a88bfdd85b3e1d6d38ee9f6957557676e30193e641dcdf87f5e2ef82a4a5e255`.
+
 ## Next: `mes-0.27` (stage1 step 76)
 
 live-bootstrap's `mes-0.27/pass1.kaem` unpacks Mes and nyacc with `ungz` and

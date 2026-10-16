@@ -87,7 +87,9 @@ enum Arg {
 }
 
 /// A decoded instruction in the form the executor uses.
+/// A power-of-two stride keeps RV64 arena indexing to a single shift.
 #[derive(Clone, Copy)]
+#[repr(align(64))]
 struct Op {
     mnemonic: Mnemonic,
     next_ip: u32,
@@ -139,10 +141,10 @@ impl Cond {
     }
 }
 
-/// Specialized forms of the most frequently executed instructions, with
-/// their 32-bit registers (`r`), byte registers (`index`, `shift`) and
-/// immediates resolved. Complex memory operands stay in `Op::args`. Every other
-/// instruction is `Generic`.
+/// Specialized forms of the most frequently executed instructions. Registers
+/// are byte offsets (0, 4, ..., 28) into `regs`, with a shift for byte operands,
+/// so execution need not scale register indices. Complex memory operands stay
+/// in `Op::args`. Every other instruction is `Generic`.
 #[derive(Clone, Copy)]
 enum Fast {
     Generic,
@@ -150,6 +152,8 @@ enum Fast {
     MovRI(u8, u32),
     MovRM(u8),
     MovRMBase(u8, u8, u32),
+    MovRIPop(u8, u32, u8),
+    MovRMBasePop(u8, u8, u32, u8),
     MovMR(u8),
     MovB8M(u8, u8),
     MovB8MBase(u8, u8, u8, u32),
@@ -158,8 +162,11 @@ enum Fast {
     MovzxRM8(u8),
     MovzxRM8Base(u8, u8, u32),
     Lea(u8),
+    LeaBase(u8, u8, u32),
     PushR(u8),
     PopR(u8),
+    Pop2(u8, u8),
+    PopRet(u8),
     AddRI(u8, u32),
     AddRR(u8, u8),
     SubRI(u8, u32),
@@ -169,6 +176,12 @@ enum Fast {
     TestRR(u8, u8),
     CmpB8B8(u8, u8, u8, u8),
     CmpB8I(u8, u8, u32),
+    CmpRIJump(u8, u32, u32, bool),
+    CmpRRJump(u8, u8, u32, bool),
+    CmpB8B8Jump(u8, u8, u8, u8, u32, bool),
+    CmpB8IJump(u8, u8, u32, u32, bool),
+    TestRRJump(u8, u8, u32, bool),
+    CmpRRBool(u8, u8, Cond, u8),
     Je(u32),
     Jne(u32),
     Jcc(Cond, u32),
@@ -191,12 +204,12 @@ impl Op {
         use Mnemonic::*;
         // A full 32-bit register operand.
         let r = |i: usize| match (self.args[i], self.sizes[i]) {
-            (Arg::Reg { index, shift: 0 }, 4) => Some(index),
+            (Arg::Reg { index, shift: 0 }, 4) => Some(index * 4),
             _ => None,
         };
         // A byte register operand.
         let b = |i: usize| match (self.args[i], self.sizes[i]) {
-            (Arg::Reg { index, shift }, 1) => Some((index, shift)),
+            (Arg::Reg { index, shift }, 1) => Some((index * 4, shift)),
             _ => None,
         };
         let m =
@@ -207,7 +220,7 @@ impl Op {
                 index: 8,
                 disp,
                 ..
-            } if base < 8 => Some((base, disp)),
+            } if base < 8 => Some((base * 4, disp)),
             _ => None,
         };
         let imm = |i: usize| match self.args[i] {
@@ -242,7 +255,9 @@ impl Op {
                     }),
                 _ => Fast::Generic,
             },
-            Lea => r(0).map_or(Fast::Generic, Fast::Lea),
+            Lea => r(0).map_or(Fast::Generic, |d| {
+                simple_mem(1).map_or(Fast::Lea(d), |(base, disp)| Fast::LeaBase(d, base, disp))
+            }),
             Push if n == 1 => r(0).map_or(Fast::Generic, Fast::PushR),
             Pop => r(0).map_or(Fast::Generic, Fast::PopR),
             Add | Sub | Cmp | Test => match (self.mnemonic, r(0), r(1), imm(1)) {
@@ -466,7 +481,7 @@ fn run_process(mut m: Machine, k: &mut Kernel, instructions: &mut u64) -> u32 {
         let op = &ops[index];
         m.eip = op.next_ip;
         count += 1;
-        if m.execute_fast(op) {
+        if m.execute_fast(op, &mut count) {
             continue;
         }
         match m.execute(op, k) {
@@ -852,11 +867,126 @@ impl Machine {
             "unsupported prefix at {:#x}",
             self.eip
         );
-        ops.push(Op::translate(&ins));
+        let mut op = Op::translate(&ins);
+        // These comparisons, register MOVs/loads and POPs cannot write code
+        // or transfer control.
+        // Fuse selected successors only within the same 15-byte fetch: the
+        // existing invalidation window then covers every constituent's bytes.
+        if matches!(
+            op.fast,
+            Fast::CmpRI(..)
+                | Fast::CmpRR(..)
+                | Fast::CmpB8B8(..)
+                | Fast::CmpB8I(..)
+                | Fast::TestRR(..)
+                | Fast::PopR(..)
+                | Fast::MovRI(..)
+                | Fast::MovRMBase(..)
+        ) {
+            let next = Decoder::with_ip(
+                32,
+                &code[ins.len()..len],
+                ins.next_ip(),
+                DecoderOptions::NONE,
+            )
+            .decode();
+            if !next.is_invalid()
+                && !next.has_lock_prefix()
+                && !next.has_rep_prefix()
+                && !next.has_repne_prefix()
+            {
+                let mut end_ip = next.next_ip32();
+                let fused = if next.op0_kind() == OpKind::NearBranch32
+                    && matches!(next.mnemonic(), Mnemonic::Je | Mnemonic::Jne)
+                {
+                    let target = next.near_branch32();
+                    let equal = next.mnemonic() == Mnemonic::Je;
+                    match op.fast {
+                        Fast::CmpRI(d, v) => Some(Fast::CmpRIJump(d, v, target, equal)),
+                        Fast::CmpRR(d, s) => Some(Fast::CmpRRJump(d, s, target, equal)),
+                        Fast::CmpB8B8(i, sh, j, sh2) => {
+                            Some(Fast::CmpB8B8Jump(i, sh, j, sh2, target, equal))
+                        }
+                        Fast::CmpB8I(i, sh, v) => Some(Fast::CmpB8IJump(i, sh, v, target, equal)),
+                        Fast::TestRR(d, s) => Some(Fast::TestRRJump(d, s, target, equal)),
+                        _ => None,
+                    }
+                } else if next.mnemonic() == Mnemonic::Pop
+                    && matches!(
+                        next.op0_register(),
+                        Register::EAX
+                            | Register::ECX
+                            | Register::EDX
+                            | Register::EBX
+                            | Register::ESP
+                            | Register::EBP
+                            | Register::ESI
+                            | Register::EDI
+                    )
+                {
+                    match (op.fast, Op::translate(&next).fast) {
+                        (Fast::PopR(d), Fast::PopR(s)) => Some(Fast::Pop2(d, s)),
+                        (Fast::MovRI(d, v), Fast::PopR(s)) => Some(Fast::MovRIPop(d, v, s)),
+                        (Fast::MovRMBase(d, base, disp), Fast::PopR(s)) => {
+                            Some(Fast::MovRMBasePop(d, base, disp, s))
+                        }
+                        _ => None,
+                    }
+                } else if let Fast::PopR(d) = op.fast {
+                    (next.mnemonic() == Mnemonic::Ret && next.op_count() == 0)
+                        .then_some(Fast::PopRet(d))
+                } else if let Fast::CmpRR(a, b) = op.fast {
+                    if Cond::of(next.mnemonic()).is_some() && next.op0_kind() == OpKind::Register {
+                        let after = Decoder::with_ip(
+                            32,
+                            &code[ins.len() + next.len()..len],
+                            next.next_ip(),
+                            DecoderOptions::NONE,
+                        )
+                        .decode();
+                        if !after.is_invalid()
+                            && !after.has_lock_prefix()
+                            && !after.has_rep_prefix()
+                            && !after.has_repne_prefix()
+                            && after.mnemonic() == Mnemonic::Movzx
+                            && after.op0_kind() == OpKind::Register
+                            && after.op1_kind() == OpKind::Register
+                        {
+                            match (Op::translate(&next).fast, Op::translate(&after).fast) {
+                                (Fast::Setcc(c, d, sh), Fast::MovzxRB8(out, from, from_sh))
+                                    if d == out && d == from && sh == from_sh =>
+                                {
+                                    // SETcc's byte write is completely overwritten
+                                    // by MOVZX to the same full register.
+                                    end_ip = after.next_ip32();
+                                    Some(Fast::CmpRRBool(a, b, c, out))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // Non-image pages are not covered by the decoded cache's
+                // invalidation range; do not extend cached spans onto them.
+                if let Some(fast) = fused
+                    .filter(|_| end_ip.wrapping_sub(self.code_start) as usize <= self.decoded.len())
+                {
+                    op.fast = fast;
+                    op.next_ip = end_ip;
+                }
+            }
+        }
+        ops.push(op);
         let off = self.eip.wrapping_sub(self.code_start) as usize;
         if off < self.decoded.len() {
             self.decoded[off] = ops.len() as u32;
-            for a in [self.eip, self.eip + ins.len() as u32 - 1] {
+            for a in [self.eip, op.next_ip.wrapping_sub(1)] {
                 self.pages[(a / PAGE) as usize] |= CODE;
             }
         }
@@ -1006,21 +1136,22 @@ impl Machine {
     }
 
     #[inline(always)]
-    fn byte_reg(&self, index: u8, shift: u8) -> u32 {
-        (self.regs[(index & 7) as usize] >> shift) & 0xff
+    fn byte_reg(&self, offset: u8, shift: u8) -> u32 {
+        (self.regs[((offset & 28) / 4) as usize] >> shift) & 0xff
     }
 
     #[inline(always)]
-    fn set_byte_reg(&mut self, index: u8, shift: u8, v: u32) {
-        let r = &mut self.regs[(index & 7) as usize];
+    fn set_byte_reg(&mut self, offset: u8, shift: u8, v: u32) {
+        let r = &mut self.regs[((offset & 28) / 4) as usize];
         *r = (*r & !(0xff << shift)) | ((v & 0xff) << shift);
     }
 
     /// Executes the instruction if it has a specialized form, with the same
-    /// semantics as `execute`. Returns false for generic instructions.
+    /// semantics as `execute`. Fused pairs also count their second instruction.
+    /// Returns false for generic instructions.
     #[inline(always)]
-    fn execute_fast(&mut self, op: &Op) -> bool {
-        let r = |i: u8| (i & 7) as usize;
+    fn execute_fast(&mut self, op: &Op, count: &mut u64) -> bool {
+        let r = |offset: u8| ((offset & 28) / 4) as usize;
         match op.fast {
             Fast::Generic => return false,
             Fast::MovRR(d, s) => self.regs[r(d)] = self.regs[r(s)],
@@ -1028,6 +1159,18 @@ impl Machine {
             Fast::MovRM(d) => self.regs[r(d)] = self.read(self.addr(op.args[1]), 4),
             Fast::MovRMBase(d, base, disp) => {
                 self.regs[r(d)] = self.read(self.regs[r(base)].wrapping_add(disp), 4);
+            }
+            Fast::MovRIPop(d, v, s) => {
+                self.regs[r(d)] = v;
+                let v = self.pop();
+                self.regs[r(s)] = v;
+                *count += 1;
+            }
+            Fast::MovRMBasePop(d, base, disp, s) => {
+                self.regs[r(d)] = self.read(self.regs[r(base)].wrapping_add(disp), 4);
+                let v = self.pop();
+                self.regs[r(s)] = v;
+                *count += 1;
             }
             Fast::MovMR(s) => self.write(self.addr(op.args[0]), 4, self.regs[r(s)]),
             Fast::MovB8M(i, sh) => {
@@ -1045,11 +1188,27 @@ impl Machine {
                 self.regs[r(d)] = self.read(self.regs[r(base)].wrapping_add(disp), 1);
             }
             Fast::Lea(d) => self.regs[r(d)] = self.addr(op.args[1]),
+            Fast::LeaBase(d, base, disp) => {
+                self.regs[r(d)] = self.regs[r(base)].wrapping_add(disp);
+            }
             Fast::PushR(s) => self.push(self.regs[r(s)]),
             Fast::PopR(d) => {
                 // `pop esp` loads the value read at the old esp.
                 let v = self.pop();
                 self.regs[r(d)] = v;
+            }
+            Fast::Pop2(d, s) => {
+                let v = self.pop();
+                self.regs[r(d)] = v;
+                let v = self.pop();
+                self.regs[r(s)] = v;
+                *count += 1;
+            }
+            Fast::PopRet(d) => {
+                let v = self.pop();
+                self.regs[r(d)] = v;
+                self.eip = self.pop();
+                *count += 1;
             }
             Fast::AddRI(d, v) => self.regs[r(d)] = self.add_flags(self.regs[r(d)], v, 4),
             Fast::AddRR(d, s) => {
@@ -1075,6 +1234,48 @@ impl Machine {
             }
             Fast::CmpB8I(i, sh, v) => {
                 self.sub_flags(self.byte_reg(i, sh), v, 1);
+            }
+            Fast::CmpRIJump(d, v, target, equal) => {
+                self.sub_flags(self.regs[r(d)], v, 4);
+                *count += 1;
+                if self.zf == equal {
+                    self.eip = target;
+                }
+            }
+            Fast::CmpRRJump(d, s, target, equal) => {
+                self.sub_flags(self.regs[r(d)], self.regs[r(s)], 4);
+                *count += 1;
+                if self.zf == equal {
+                    self.eip = target;
+                }
+            }
+            Fast::CmpB8B8Jump(i, sh, j, sh2, target, equal) => {
+                self.sub_flags(self.byte_reg(i, sh), self.byte_reg(j, sh2), 1);
+                *count += 1;
+                if self.zf == equal {
+                    self.eip = target;
+                }
+            }
+            Fast::CmpB8IJump(i, sh, v, target, equal) => {
+                self.sub_flags(self.byte_reg(i, sh), v, 1);
+                *count += 1;
+                if self.zf == equal {
+                    self.eip = target;
+                }
+            }
+            Fast::TestRRJump(d, s, target, equal) => {
+                self.cf = false;
+                self.of = false;
+                self.set_zs(self.regs[r(d)] & self.regs[r(s)], 4);
+                *count += 1;
+                if self.zf == equal {
+                    self.eip = target;
+                }
+            }
+            Fast::CmpRRBool(a, b, c, out) => {
+                self.sub_flags(self.regs[r(a)], self.regs[r(b)], 4);
+                self.regs[r(out)] = self.cond(c) as u32;
+                *count += 2;
             }
             Fast::Je(t) => {
                 if self.zf {
@@ -1766,6 +1967,35 @@ impl Kernel<'_> {
 mod tests {
     use super::{run, Entry};
 
+    fn image(code: &[u8], base: u32) -> Vec<u8> {
+        // A static ELF32/i386 image with one load segment and code at +84.
+        let size = 84 + code.len() as u32;
+        let mut elf = b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        for word in [
+            0x0003_0002u32,
+            1,
+            base + 84,
+            52,
+            0,
+            0,
+            0x0020_0034,
+            1,
+            0,
+            1,
+            0,
+            base,
+            base,
+            size,
+            size,
+            7,
+            4096,
+        ] {
+            elf.extend_from_slice(&word.to_le_bytes());
+        }
+        elf.extend_from_slice(code);
+        elf
+    }
+
     #[test]
     fn stack_pages_are_zeroed_and_private_across_fork() {
         // i386 code: write 0x89abcdef at 0xbf900000, check the next page
@@ -1782,34 +2012,59 @@ mod tests {
             "01000000cd80",
         ))
         .unwrap();
-        // A static ELF32/i386 image with one load segment and code at +84.
-        let size = 84 + code.len() as u32;
-        let mut elf = b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
-        for word in [
-            0x0003_0002u32,
-            1,
-            0x0804_8054,
-            52,
-            0,
-            0,
-            0x0020_0034,
-            1,
-            0,
-            1,
-            0,
-            0x0804_8000,
-            0x0804_8000,
-            size,
-            size,
-            7,
-            4096,
-        ] {
-            elf.extend_from_slice(&word.to_le_bytes());
-        }
-        elf.extend_from_slice(&code);
-        let exit = run(&elf, &["stack-check".into()], &[], "/", &mut |_| {
+        let exit = run(
+            &image(&code, 0x0804_8000),
+            &["stack-check".into()],
+            &[],
+            "/",
+            &mut |_| Entry::Missing,
+        );
+        assert_eq!(exit.code, 0);
+    }
+
+    #[test]
+    fn comparison_flags_and_modified_branch_are_preserved() {
+        // Call CMP EAX,0; JE target_one across a page boundary, then patch
+        // only JE's displacement on the next page and call it again. It
+        // must reach target_two. Call JE directly with ZF=1 but EAX=-1 to
+        // check that entering the second instruction does not repeat CMP.
+        // Finally CMP 0x80000000,1; JE (not taken) must leave OF=1,CF=SF=0.
+        // Each failed check exits 1; the successful path is 33 instructions.
+        let mut code = hex::decode(concat!(
+            "31c0e8a20f000083fb017541c70502900408adf0ffffe88e0f000083fb02752d",
+            "b8ffffffff39c0e8800f000083fb02751cb80000008083f80174127110720e780c",
+            "bb00000000b801000000cd80bb01000000b801000000cd80bb01000000c3",
+            "bb02000000c3",
+        ))
+        .unwrap();
+        // With the 84-byte ELF header, CMP starts at 0x08048ffd and JE
+        // starts at 0x08049000. Neither target executes on JE's page.
+        code.resize(4096 - 84 - 3, 0);
+        code.extend(hex::decode("83f8000f84a7f0ffffbb03000000c3").unwrap());
+        let exit = run(&image(&code, 0x0804_8000), &[], &[], "/", &mut |_| {
             Entry::Missing
         });
         assert_eq!(exit.code, 0);
+        assert_eq!(exit.instructions, 33);
+    }
+
+    #[test]
+    fn code_can_continue_from_image_onto_stack() {
+        // The image ends at the bottom of the mapped stack. Write a JE
+        // there, execute CMP at the end of the image followed by that JE,
+        // then write farther into the stack. This must not mark the stack
+        // page as belonging to the image's decoded cache.
+        let mut code = hex::decode(concat!(
+            "66c705000080bf0f84c705020080bf7bf0ffff31c0e88f0f0000c605640080bf42",
+            "bb00000000b801000000cd80c3",
+        ))
+        .unwrap();
+        code.resize(4096 - 84 - 3, 0);
+        code.extend([0x83, 0xf8, 0x00]); // CMP EAX,0 at 0xbf7ffffd.
+        let exit = run(&image(&code, 0xbf7f_f000), &[], &[], "/", &mut |_| {
+            Entry::Missing
+        });
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.instructions, 11);
     }
 }
