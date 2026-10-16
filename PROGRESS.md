@@ -20,16 +20,18 @@ Stage 1 runs each `pass1.kaem` script as one step: the guest emulates stage 0's
 script's interpretation. The step list comes from StageX's stage1
 `Containerfile`, vendored verbatim in `stagex/stage1/Containerfile`.
 
-## SP1 cycles per step
+## SP1 cycles per step (historical range runs)
 
 Measured with `cargo run --release --bin stagex -- --execute` (SP1 6.9.0, light
 executor), which runs every step in the zkVM without proving it. "SP1 cycles"
 is the executor's instruction count for the step. Steps were measured in
 parallel ranges with `--from`.
 
-The cost is about 56 SP1 cycles per emulated x86 instruction, plus a fixed
+The original cost was about 56 SP1 cycles per emulated x86 instruction, plus a fixed
 15–90M cycles per step for reading, hashing and committing the step's files.
-Pending steps can be estimated from their x86 instruction counts on that basis.
+Pending estimates below use that original guest. The optimization results
+below compare exact guests separately; this table is retained as historical
+evidence, not mixed with new-guest measurements.
 
 | Step | Tool | Output | x86 instructions | SP1 cycles | Approx. |
 |---:|---|---|---:|---:|---:|
@@ -206,6 +208,86 @@ optimizations.
 - Guest ELF SHA-256: `d3a0b65fd3b41e640bbd9a53aa315b8a42744fc24b187ac4a177e7cb9599bbb1`.
 - `lib/src/x86.rs` SHA-256: `dbd33701c3afe922acabcd227091ca2174c88c3f2fae0c46f50c43f4cf582713`.
 - `lib/src/stagex.rs` SHA-256: `51a5a649201f3ee3b7f83cfce7858f5d1805171cc2278d44b3d1a1503fcde6ba`.
+
+## Emulator optimizations — 2026-10-16
+
+The RV64 guest still executes the same pinned i386 programs, including their
+file I/O. No output, syscall result or predecoded instruction stream is
+substituted by unverified host computation. These measurements compare the
+exact baseline above against the optimized guest, with matching gas settings.
+Do not compare them directly with the earlier historical range runs.
+
+### Retained changes
+
+- Widen decoded-cache offset arithmetic before subtraction, avoiding RV64
+  truncation/zero-extension in every interpreter iteration. Out-of-image
+  addresses still miss the cache.
+- Keep the entire 8 MiB stack mapped, but share an immutable zero backing
+  page for untouched pages. Allocate private pages on first write. This
+  avoids eager zeroing and reduces fork's physical memory copy without
+  changing stack size, memory permissions or parent/child isolation.
+- Specialize JE/JNE and common base-plus-displacement MOV/MOVZX loads.
+  Complex addressing retains its existing checked path; cached instructions
+  are still invalidated when their code bytes change.
+- Omit iced-x86's VEX, EVEX, XOP and 3DNow decoder tables. The emulator did
+  not support those instruction families; supported legacy decoding remains.
+
+An out-of-line generic-executor experiment slightly increased cycles and
+was rejected. `experiments.csv` records the incremental experiments.
+
+### Before/after execution costs
+
+| Step | Output | Baseline SP1 cycles | Optimized SP1 cycles | Reduction | Baseline normalized gas | Optimized normalized gas | Reduction |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | `hex0` | 18,905,462 | 11,949,887 | 36.79% | 32,320,104 | 15,594,878 | 51.75% |
+| 6 | `M0.hex2` | 15,421,039 | 6,693,109 | 56.60% | 48,074,548 | 15,850,927 | 67.03% |
+| 8 | `cc_x86-0.hex2` | 2,085,215,511 | 1,882,412,249 | 9.73% | 1,946,817,228 | 1,696,105,667 | 12.88% |
+| 17 | `blood-elf-0.M1` | 49,322,020,830 | 46,123,377,109 | 6.49% | 44,882,925,680 | 40,975,823,513 | 8.71% |
+
+All measured claims match the pinned-hash-checked native claims. Emulated
+x86 instruction counts are unchanged: 130,316; 78; 39,351,099; and
+891,500,857 respectively. Steps 1, 6 and 8 were each repeated three times;
+cycles and gas were identical across repeats. Step 17 was measured once.
+
+Isolated median SDK execution times on this orb, with the five background
+bootstrap jobs frozen and no concurrent test/build:
+
+| Step | Baseline seconds | Optimized seconds | Reduction |
+|---:|---:|---:|---:|
+| 1 | 0.356618 | 0.335293 | 5.98% |
+| 6 | 0.328540 | 0.213091 | 35.14% |
+| 8 | 21.095358 | 20.332980 | 3.61% |
+
+These are three-sample medians, not statistically established speedups or
+proving times. Step 17's optimized wall time overlapped a native full-chain
+test and is not used for a timing comparison. All five background jobs were
+resumed after the isolated measurements. No new proof was attempted: the
+baseline prover-initialization memory failure remains unresolved. Cycle and
+gas reductions are cost proxies, not a measured proving-time reduction.
+
+### Validation and reproduction
+
+- `cargo test --release -p hex0-lib`: 4 passed, 1 ignored.
+- `cargo test --release -p hex0-lib stagex_chain_full -- --ignored --nocapture`:
+  passed after a clean package rebuild in 386.64 s; all 75 implemented steps
+  retain their output hashes.
+- A retained public-interface regression checks untouched stack zeros,
+  independent pages, a cross-page word, and fork isolation. A scratch mutant
+  that lets direct stores overwrite the shared zero page fails this test.
+- Additional scratch diagnostics passed on both original and optimized
+  emulators: stack boundaries and unmapped neighbors, read-only protection,
+  syscall reads spanning untouched pages, negative displacements/high-byte
+  register aliasing, and self-modifying cached code invalidation.
+
+Evidence is in `.amp/in/artifacts/optimization/`, including raw execution
+JSONL, comparison CSV, test logs, experiment results, source hashes and
+`REPRODUCE.md`. `reproduce.tar.gz` contains the harness, locked dependencies,
+exact optimized ELF and library snapshot. The snapshot includes the same
+pending Mes SAL/ioctl support as the baseline; it is kept separate from the
+optimization-only patch.
+
+- Optimized guest ELF SHA-256: `58fe0a31a31a818bb28495ac86cd2bcd232a006b8ba4222f2a5e99fa4fd64e84`.
+- Optimized `lib/src/x86.rs` SHA-256: `ac2992b11a3e3cb69378cf7d0af6032bd296e5f9acace55deabc0357a87d3a31`.
 
 ## Next: `mes-0.27` (stage1 step 76)
 

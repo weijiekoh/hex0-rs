@@ -61,6 +61,8 @@ const WRITABLE: u32 = 2;
 /// The page holds bytes of cached decoded instructions, so writes to it must
 /// invalidate them.
 const CODE: u32 = 4;
+/// An untouched stack page shares immutable zero backing until its first write.
+const ZERO: u32 = 8;
 const FLAGS: u32 = PAGE - 1;
 const PAGES: usize = 1 << 20;
 
@@ -139,7 +141,7 @@ impl Cond {
 
 /// Specialized forms of the most frequently executed instructions, with
 /// their 32-bit registers (`r`), byte registers (`index`, `shift`) and
-/// immediates resolved. Memory operands stay in `Op::args`. Every other
+/// immediates resolved. Complex memory operands stay in `Op::args`. Every other
 /// instruction is `Generic`.
 #[derive(Clone, Copy)]
 enum Fast {
@@ -147,11 +149,14 @@ enum Fast {
     MovRR(u8, u8),
     MovRI(u8, u32),
     MovRM(u8),
+    MovRMBase(u8, u8, u32),
     MovMR(u8),
     MovB8M(u8, u8),
+    MovB8MBase(u8, u8, u8, u32),
     MovMB8(u8, u8),
     MovzxRB8(u8, u8, u8),
     MovzxRM8(u8),
+    MovzxRM8Base(u8, u8, u32),
     Lea(u8),
     PushR(u8),
     PopR(u8),
@@ -164,6 +169,8 @@ enum Fast {
     TestRR(u8, u8),
     CmpB8B8(u8, u8, u8, u8),
     CmpB8I(u8, u8, u32),
+    Je(u32),
+    Jne(u32),
     Jcc(Cond, u32),
     Jmp(u32),
     Call(u32),
@@ -194,6 +201,15 @@ impl Op {
         };
         let m =
             |i: usize, size: u8| matches!(self.args[i], Arg::Mem { .. }) && self.sizes[i] == size;
+        let simple_mem = |i: usize| match self.args[i] {
+            Arg::Mem {
+                base,
+                index: 8,
+                disp,
+                ..
+            } if base < 8 => Some((base, disp)),
+            _ => None,
+        };
         let imm = |i: usize| match self.args[i] {
             Arg::Imm(v) => Some(v),
             _ => None,
@@ -207,15 +223,23 @@ impl Op {
             Mov if n == 2 => match (r(0), r(1), imm(1), b(0), b(1)) {
                 (Some(d), Some(s), ..) => Fast::MovRR(d, s),
                 (Some(d), _, Some(v), ..) => Fast::MovRI(d, v),
-                (Some(d), ..) if m(1, 4) => Fast::MovRM(d),
+                (Some(d), ..) if m(1, 4) => simple_mem(1).map_or(Fast::MovRM(d), |(base, disp)| {
+                    Fast::MovRMBase(d, base, disp)
+                }),
                 (_, Some(s), ..) if m(0, 4) => Fast::MovMR(s),
-                (_, _, _, Some((i, sh)), _) if m(1, 1) => Fast::MovB8M(i, sh),
+                (_, _, _, Some((i, sh)), _) if m(1, 1) => simple_mem(1)
+                    .map_or(Fast::MovB8M(i, sh), |(base, disp)| {
+                        Fast::MovB8MBase(i, sh, base, disp)
+                    }),
                 (_, _, _, _, Some((i, sh))) if m(0, 1) => Fast::MovMB8(i, sh),
                 _ => Fast::Generic,
             },
             Movzx => match (r(0), b(1)) {
                 (Some(d), Some((i, sh))) => Fast::MovzxRB8(d, i, sh),
-                (Some(d), _) if m(1, 1) => Fast::MovzxRM8(d),
+                (Some(d), _) if m(1, 1) => simple_mem(1)
+                    .map_or(Fast::MovzxRM8(d), |(base, disp)| {
+                        Fast::MovzxRM8Base(d, base, disp)
+                    }),
                 _ => Fast::Generic,
             },
             Lea => r(0).map_or(Fast::Generic, Fast::Lea),
@@ -240,6 +264,8 @@ impl Op {
             Call => branch.map_or(Fast::Generic, Fast::Call),
             Ret if n == 0 => Fast::Ret,
             m => match (Cond::of(m), branch, b(0)) {
+                (Some(Cond::E), Some(t), _) => Fast::Je(t),
+                (Some(Cond::Ne), Some(t), _) => Fast::Jne(t),
                 (Some(c), Some(t), _) => Fast::Jcc(c, t),
                 (Some(c), None, Some((i, sh))) => Fast::Setcc(c, i, sh),
                 _ => Fast::Generic,
@@ -569,7 +595,7 @@ impl Machine {
         let phnum = u16_at(elf, 0x2c) as usize;
 
         let mut m = Machine {
-            mem: Vec::with_capacity((STACK_SIZE as usize + elf.len()) / 4 + PAGE as usize),
+            mem: Vec::with_capacity(elf.len() / 4 + PAGE as usize),
             pages: vec![0; PAGES].into_boxed_slice().try_into().unwrap(),
             free: Vec::new(),
             code_start: u32::MAX,
@@ -630,9 +656,12 @@ impl Machine {
         // The program break starts at the page after the image.
         m.brk_start = image_end;
         m.brk = image_end;
-        for page in (STACK_TOP - STACK_SIZE) / PAGE..STACK_TOP / PAGE {
-            m.map(page, WRITABLE);
-        }
+        // Keep the full stack mapped, but back its untouched pages with one
+        // immutable zero page. Writes materialize a private page below.
+        let stack = ((STACK_TOP - STACK_SIZE) / PAGE) as usize..(STACK_TOP / PAGE) as usize;
+        m.map(stack.start as u32, WRITABLE | ZERO);
+        let zero = m.pages[stack.start];
+        m.pages[stack].fill(zero);
 
         // Initial stack: argc, argv pointers, NULL, environment pointers,
         // NULL and an auxiliary vector holding only AT_NULL. All registers
@@ -722,7 +751,7 @@ impl Machine {
     fn write(&mut self, addr: u32, size: u32, val: u32) {
         let e = self.pages[(addr / PAGE) as usize];
         let o = ((e & !FLAGS) | (addr & FLAGS)) as usize;
-        let plain = e & (MAPPED | WRITABLE | CODE) == MAPPED | WRITABLE;
+        let plain = e & (MAPPED | WRITABLE | CODE | ZERO) == MAPPED | WRITABLE;
         match size {
             4 if plain && addr % 4 == 0 => self.mem[o / 4] = val,
             1 if plain => self.set_byte(o, val as u8),
@@ -731,15 +760,22 @@ impl Machine {
     }
 
     /// Writes bytes one at a time, invalidating decoded instructions they
-    /// overlap, or panics on unmapped or read-only memory.
+    /// overlap and materializing shared zero pages on demand. Panics on
+    /// unmapped or read-only memory.
     #[cold]
     #[inline(never)]
     fn write_slow(&mut self, addr: u32, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             let a = addr.wrapping_add(i as u32);
-            let e = self.pages[(a / PAGE) as usize];
+            let page = (a / PAGE) as usize;
+            let mut e = self.pages[page];
             assert!(e & MAPPED != 0, "access to unmapped memory at {a:#x}");
             assert!(e & WRITABLE != 0, "write to read-only memory at {a:#x}");
+            if e & ZERO != 0 {
+                self.pages[page] = 0;
+                self.map(page as u32, e & (WRITABLE | CODE));
+                e = self.pages[page];
+            }
             self.set_byte(((e & !FLAGS) + (a & FLAGS)) as usize, *b);
             if e & CODE != 0 {
                 // An x86 instruction is at most 15 bytes long.
@@ -769,7 +805,7 @@ impl Machine {
             let a = addr.wrapping_add(done as u32);
             let e = self.pages[(a / PAGE) as usize];
             let n = (bytes.len() - done).min((PAGE - (a & FLAGS)) as usize);
-            if e & (MAPPED | WRITABLE | CODE) == MAPPED | WRITABLE {
+            if e & (MAPPED | WRITABLE | CODE | ZERO) == MAPPED | WRITABLE {
                 let o = ((e & !FLAGS) + (a & FLAGS)) as usize;
                 for (i, b) in bytes[done..done + n].iter().enumerate() {
                     self.set_byte(o + i, *b);
@@ -785,7 +821,9 @@ impl Machine {
     /// it is not cached.
     #[inline(always)]
     fn decode(&mut self, ops: &mut Vec<Op>) -> usize {
-        let off = self.eip.wrapping_sub(self.code_start) as usize;
+        // Out-of-image addresses miss the cache either way. Widen first so
+        // RV64 need not truncate and zero-extend the difference on every step.
+        let off = (self.eip as usize).wrapping_sub(self.code_start as usize);
         if let Some(&n) = self.decoded.get(off) {
             if n != 0 {
                 return n as usize - 1;
@@ -988,14 +1026,24 @@ impl Machine {
             Fast::MovRR(d, s) => self.regs[r(d)] = self.regs[r(s)],
             Fast::MovRI(d, v) => self.regs[r(d)] = v,
             Fast::MovRM(d) => self.regs[r(d)] = self.read(self.addr(op.args[1]), 4),
+            Fast::MovRMBase(d, base, disp) => {
+                self.regs[r(d)] = self.read(self.regs[r(base)].wrapping_add(disp), 4);
+            }
             Fast::MovMR(s) => self.write(self.addr(op.args[0]), 4, self.regs[r(s)]),
             Fast::MovB8M(i, sh) => {
                 let v = self.read(self.addr(op.args[1]), 1);
                 self.set_byte_reg(i, sh, v);
             }
+            Fast::MovB8MBase(i, sh, base, disp) => {
+                let v = self.read(self.regs[r(base)].wrapping_add(disp), 1);
+                self.set_byte_reg(i, sh, v);
+            }
             Fast::MovMB8(i, sh) => self.write(self.addr(op.args[0]), 1, self.byte_reg(i, sh)),
             Fast::MovzxRB8(d, i, sh) => self.regs[r(d)] = self.byte_reg(i, sh),
             Fast::MovzxRM8(d) => self.regs[r(d)] = self.read(self.addr(op.args[1]), 1),
+            Fast::MovzxRM8Base(d, base, disp) => {
+                self.regs[r(d)] = self.read(self.regs[r(base)].wrapping_add(disp), 1);
+            }
             Fast::Lea(d) => self.regs[r(d)] = self.addr(op.args[1]),
             Fast::PushR(s) => self.push(self.regs[r(s)]),
             Fast::PopR(d) => {
@@ -1027,6 +1075,16 @@ impl Machine {
             }
             Fast::CmpB8I(i, sh, v) => {
                 self.sub_flags(self.byte_reg(i, sh), v, 1);
+            }
+            Fast::Je(t) => {
+                if self.zf {
+                    self.eip = t;
+                }
+            }
+            Fast::Jne(t) => {
+                if !self.zf {
+                    self.eip = t;
+                }
             }
             Fast::Jcc(c, t) => {
                 if self.cond(c) {
@@ -1701,5 +1759,57 @@ impl Kernel<'_> {
             deleted: false,
         });
         Ok(self.files.len() - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run, Entry};
+
+    #[test]
+    fn stack_pages_are_zeroed_and_private_across_fork() {
+        // i386 code: write 0x89abcdef at 0xbf900000, check the next page
+        // still reads zero, then write/read 0x10203040 across the following
+        // page boundary. Fork a child that overwrites both a populated and
+        // an untouched page; the parent waits and checks its original word
+        // and untouched zeros. Any failed comparison exits with status 1.
+        let code = hex::decode(concat!(
+            "bf000090bfc707efcdab898b870010000083f8000f8580000000c787fe1f0000",
+            "403020108b87fe1f00003d4030201075698b073defcdab8975608b8700300000",
+            "83f8007555b802000000cd8083f800742d89c331c931d2b807000000cd808b07",
+            "3defcdab8975338b870030000083f8007528bb00000000b801000000cd80c707",
+            "88776655c78700300000ccbbaa99bb00000000b801000000cd80bb01000000b8",
+            "01000000cd80",
+        ))
+        .unwrap();
+        // A static ELF32/i386 image with one load segment and code at +84.
+        let size = 84 + code.len() as u32;
+        let mut elf = b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        for word in [
+            0x0003_0002u32,
+            1,
+            0x0804_8054,
+            52,
+            0,
+            0,
+            0x0020_0034,
+            1,
+            0,
+            1,
+            0,
+            0x0804_8000,
+            0x0804_8000,
+            size,
+            size,
+            7,
+            4096,
+        ] {
+            elf.extend_from_slice(&word.to_le_bytes());
+        }
+        elf.extend_from_slice(&code);
+        let exit = run(&elf, &["stack-check".into()], &[], "/", &mut |_| {
+            Entry::Missing
+        });
+        assert_eq!(exit.code, 0);
     }
 }
