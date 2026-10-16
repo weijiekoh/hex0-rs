@@ -1805,6 +1805,7 @@ dependencies = [
  "dotenv",
  "hex",
  "hex0-lib",
+ "serde_json",
  "sha2",
  "sp1-build",
  "sp1-sdk",

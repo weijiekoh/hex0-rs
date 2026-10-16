@@ -17,6 +17,10 @@ name = "stagex"
 path = "src/bin/stagex.rs"
 
 [[bin]]
+name = "stagex-bench"
+path = "src/bin/stagex-bench.rs"
+
+[[bin]]
 name = "vkey"
 path = "src/bin/vkey.rs"
 
@@ -29,6 +33,7 @@ alloy-sol-types = { workspace = true }
 hex0-lib = { path = "../lib" }
 dotenv = "0.15.0"
 sha2 = "0.10.9"
+serde_json = "1"
 
 [build-dependencies]
 sp1-build = "6.9.0"
