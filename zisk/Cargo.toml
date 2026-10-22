@@ -1,0 +1,10 @@
+[workspace]
+members = ["guest", "host"]
+resolver = "2"
+
+[workspace.dependencies]
+alloy-sol-types = "1.0"
+
+# ZisK's SHA-256 precompile, as SP1's workspace uses its sha2 patch.
+[patch.crates-io]
+sha2 = { git = "https://github.com/0xPolygonHermez/zisk-patch-hashes", package = "sha2", tag = "patch-sha2-0.10.9-zisk-0.16.0+" }

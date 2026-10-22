@@ -1,0 +1,10 @@
+[package]
+name = "stagex-x86-zisk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex0-lib = { path = "../../lib" }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+sha2 = "0.10.9"
+ziskos = "=1.3.2-alpha"
